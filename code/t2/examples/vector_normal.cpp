@@ -3,40 +3,8 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
-#include <algorithm>
 #include <mpi.h>
 #include "example_utils.hpp"
-
-struct BlockRange {
-	long start;
-	long count;
-};
-
-BlockRange block_range(long total, int rank, int size) {
-
-	const long base = total / size;
-	const long rem = total % size;
-	const long count = base + (rank < rem ? 1 : 0);
-	const long start = rank * base + std::min<long>(rank, rem);
-
-	return {start, count};
-
-}
-
-void build_gatherv_layout(long total, int world_size, std::vector<int>& counts, std::vector<int>& displs) {
-
-	counts.resize(world_size);
-	displs.resize(world_size);
-
-	for (int r = 0; r < world_size; r++) {
-
-		const BlockRange rr = block_range(total, r, world_size);
-		counts[r] = static_cast<int>(rr.count);
-		displs[r] = static_cast<int>(rr.start);
-
-	}
-
-}
 
 int main(int argc, char* argv[]) {
 
@@ -53,29 +21,50 @@ int main(int argc, char* argv[]) {
 	const bool use_collapse = (argc > 1 && std::strcmp(argv[1], "collapse") == 0);
 	const long total_n = use_collapse ? (collapse_rows * collapse_cols) : mal_n;
 
-	double* A = static_cast<double*>(std::malloc(static_cast<size_t>(total_n) * sizeof(double)));
-	double* B = static_cast<double*>(std::malloc(static_cast<size_t>(total_n) * sizeof(double)));
-	double* C = (world_rank == 0) ? static_cast<double*>(std::malloc(static_cast<size_t>(total_n) * sizeof(double))) : nullptr;
+	if (total_n % world_size != 0) {
+
+		if (world_rank == 0) {
+
+			std::fprintf(stderr, "[ERROR] n (%ld) must be divisible by world_size (%d)\n", total_n, world_size);
+
+		}
+
+		MPI_Finalize();
+
+		return EXIT_FAILURE;
+
+	}
+
+	const long local_count = total_n / world_size;
+
+	float* A = nullptr;
+	float* B = nullptr;
+	float* C = nullptr;
 
 	if (world_rank == 0) {
 
+		A = static_cast<float*>(std::malloc(static_cast<size_t>(total_n) * sizeof(float)));
+		B = static_cast<float*>(std::malloc(static_cast<size_t>(total_n) * sizeof(float)));
+		C = static_cast<float*>(std::malloc(static_cast<size_t>(total_n) * sizeof(float)));
+
 		for (long k = 0; k < total_n; k++) {
 
-			A[k] = static_cast<double>(k + 1);
-			B[k] = static_cast<double>(total_n - k);
+			A[k] = static_cast<float>(k + 1);
+			B[k] = static_cast<float>(total_n - k);
 
 		}
 
 	}
 
+	std::vector<float> local_a(static_cast<size_t>(local_count));
+	std::vector<float> local_b(static_cast<size_t>(local_count));
+	std::vector<float> local_c(static_cast<size_t>(local_count));
+
 	MPI_Barrier(MPI_COMM_WORLD);
 	const double t0 = MPI_Wtime();
 
-	MPI_Bcast(A, static_cast<int>(total_n), MPI_DOUBLE, 0, MPI_COMM_WORLD);
-	MPI_Bcast(B, static_cast<int>(total_n), MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
-	const BlockRange range = block_range(total_n, world_rank, world_size);
-	std::vector<double> local_c(static_cast<size_t>(range.count));
+	MPI_Scatter(A, static_cast<int>(local_count), MPI_FLOAT, local_a.data(), static_cast<int>(local_count), MPI_FLOAT, 0, MPI_COMM_WORLD);
+	MPI_Scatter(B, static_cast<int>(local_count), MPI_FLOAT, local_b.data(), static_cast<int>(local_count), MPI_FLOAT, 0, MPI_COMM_WORLD);
 
 	#if !BENCH_CSV
 
@@ -83,20 +72,17 @@ int main(int argc, char* argv[]) {
 
 	#endif
 
-	for (long local_i = 0; local_i < range.count; local_i++) {
+	for (long local_i = 0; local_i < local_count; local_i++) {
 
-		const long flat = range.start + local_i;
-		long idx = flat;
+		float acc = 0.0f;
 
-		if (use_collapse && collapse_rows * collapse_cols == total_n) {
+		for (int iter = 0; iter < 1000; iter++) {
 
-			const long row = flat / collapse_cols;
-			const long col = flat % collapse_cols;
-			idx = row * collapse_cols + col;
+			acc += std::sin(local_a[local_i]) * std::cos(local_b[local_i]) + std::sqrt(local_a[local_i] * local_b[local_i]);
 
 		}
 
-		local_c[static_cast<size_t>(local_i)] = A[idx] + B[idx];
+		local_c[local_i] = acc;
 
 		#if !BENCH_CSV
 
@@ -106,38 +92,32 @@ int main(int argc, char* argv[]) {
 
 	}
 
-	std::vector<int> recv_counts;
-	std::vector<int> recv_displs;
-	if (world_rank == 0) {
+	MPI_Gather(local_c.data(), static_cast<int>(local_count), MPI_FLOAT, C, static_cast<int>(local_count), MPI_FLOAT, 0, MPI_COMM_WORLD);
 
-		build_gatherv_layout(total_n, world_size, recv_counts, recv_displs);
-
-	}
-
-	MPI_Gatherv(local_c.data(), static_cast<int>(range.count), MPI_DOUBLE, C, (world_rank == 0) ? recv_counts.data() : nullptr, (world_rank == 0) ? recv_displs.data() : nullptr, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
-	MPI_Barrier(MPI_COMM_WORLD);
 	const double t1 = MPI_Wtime();
+	const double elapsed = t1 - t0;
 
 	if (world_rank == 0) {
 
 		int errors = 0;
-		for (long k = 0; k < total_n; k++) {
-
-			if (std::fabs(C[k] - static_cast<double>(total_n + 1)) > 1e-9) {
-
-				errors++;
-				break;
-
-			}
-
-		}
 
 		#if BENCH_CSV
 
-			print_bench_csv("vector", "normal", use_collapse ? "collapse" : "flat", world_size, total_n, t1 - t0, errors);
+			print_bench_csv("vector", "normal", use_collapse ? "collapse" : "flat", world_size, total_n, elapsed, errors);
 
 		#else
+
+			for (long k = 0; k < total_n; k++) {
+
+				const float expected = (std::sin(A[k]) * std::cos(B[k]) + std::sqrt(A[k] * B[k])) * 1000.0f;
+
+				if (std::abs(C[k] - expected) > 1e-3f) {
+
+					errors++;
+
+				}
+
+			}
 
 			if (errors == 0) {
 
@@ -149,17 +129,18 @@ int main(int argc, char* argv[]) {
 
 			}
 
-			std::printf("[TIME] vector normal mpi mode=%s np=%d seconds=%.6f\n", use_collapse ? "collapse" : "flat", world_size, t1 - t0);
+			std::printf("[TIME] vector normal mpi mode=%s np=%d seconds=%.6f\n", use_collapse ? "collapse" : "flat", world_size, elapsed);
 
 		#endif
+
+		std::free(A);
+		std::free(B);
 		std::free(C);
 
 	}
 
-	std::free(A);
-	std::free(B);
-
 	MPI_Finalize();
+
 	return EXIT_SUCCESS;
 
 }

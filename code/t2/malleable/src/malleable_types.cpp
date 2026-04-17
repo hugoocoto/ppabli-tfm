@@ -23,6 +23,7 @@
 #include <optional>
 #include <pthread.h>
 #include <thread>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -979,6 +980,12 @@ const char* mal_log_level_name(MalLogLevel level) {
 
 const char* mal_log_level_color(MalLogLevel level) {
 
+	if (!isatty(STDOUT_FILENO)) {
+
+		return "";
+
+	}
+
 	switch (level) {
 
 		case MAL_LOG_DEBUG: return "\x1b[36m";
@@ -994,7 +1001,7 @@ const char* mal_log_level_color(MalLogLevel level) {
 
 const char* mal_log_reset_color() {
 
-	return "\x1b[0m";
+	return isatty(STDOUT_FILENO) ? "\x1b[0m" : "";
 
 }
 

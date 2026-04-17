@@ -1,214 +1,107 @@
 #include <cstdlib>
-#include <algorithm>
+#include <cstdio>
 #include <cmath>
+#include <algorithm>
 #include <mpi.h>
 #include "malleable.hpp"
 #include "example_utils.hpp"
 
-static int SPARSE_ROWS = 3600;
-static int SPARSE_COLS = 4096;
-static int SPARSE_MAX_ROW_NNZ = 240;
+int main(int argc, char* argv[]) {
 
-double x_val_for_col(int col) {
+	mal_init(MAL_RESIZE_POLICY_AUTO);
 
-	return 1.0 + static_cast<double>(col % 9) * 0.075;
+	const long M = parse_arg_long(argc, argv, "rows", 1000);
+	const long K = parse_arg_long(argc, argv, "inner", 1000);
+	const long N = parse_arg_long(argc, argv, "cols", 1000);
+	const long nnz_a = parse_arg_long(argc, argv, "nnz-a", 500);
+	const long nnz_b = parse_arg_long(argc, argv, "nnz-b", 500);
 
-}
+	float *A = nullptr, *B = nullptr, *C = nullptr;
 
-int nnz_for_row(long row) {
+	if (mal_rank() == 0) {
 
-	const long block = (row / 36) % 5;
+		A = static_cast<float*>(std::calloc(static_cast<size_t>(M * K), sizeof(float)));
+		B = static_cast<float*>(std::calloc(static_cast<size_t>(K * N), sizeof(float)));
+		C = static_cast<float*>(std::calloc(static_cast<size_t>(M * N), sizeof(float)));
 
-	if (block == 0) {
+		const long nnz_a_row = std::min(nnz_a, K);
 
-		return 6 + static_cast<int>(row % 7);
+		for (long r = 0; r < M; r++) {
 
-	}
+			for (long k = 0; k < nnz_a_row; k++) {
 
-	if (block == 1) {
-
-		return 24 + static_cast<int>(row % 17);
-
-	}
-
-	if (block == 2) {
-
-		return 80 + static_cast<int>(row % 29);
-
-	}
-
-	if (block == 3) {
-
-		return 140 + static_cast<int>((row % 6) * 12);
-
-	}
-
-	if ((row % 4) == 0) {
-
-		return 220;
-
-	}
-
-	return 42 + static_cast<int>(row % 23);
-
-}
-
-int clamped_nnz_for_row(long row) {
-
-	return std::min(nnz_for_row(row), SPARSE_MAX_ROW_NNZ);
-
-}
-
-int stride_for_row(long row) {
-
-	int stride = 17 + static_cast<int>(row % 31);
-
-	if ((stride % 2) == 0) {
-
-		stride++;
-
-	}
-
-	return stride;
-
-}
-
-int seed_for_row(long row) {
-
-	return static_cast<int>((row * 59 + (row / 9) * 83 + 7) % SPARSE_COLS);
-
-}
-
-int col_for(long row, int k) {
-
-	return (seed_for_row(row) + k * stride_for_row(row) + (k % 5) * 19) % SPARSE_COLS;
-
-}
-
-double val_for(long row, int k) {
-
-	return 0.4 + static_cast<double>((row + k) % 21) * 0.11;
-
-}
-
-long build_sparse_problem(int* row_nnz, int* col_idx, double* values, double* x) {
-
-	for (int c = 0; c < SPARSE_COLS; c++) {
-
-		x[c] = x_val_for_col(c);
-
-	}
-
-	long total_nnz = 0;
-
-	for (long row = 0; row < SPARSE_ROWS; row++) {
-
-		const int clamped_nnz = clamped_nnz_for_row(row);
-
-		row_nnz[row] = clamped_nnz;
-		total_nnz += clamped_nnz;
-
-		const long base = row * SPARSE_MAX_ROW_NNZ;
-
-		for (int k = 0; k < SPARSE_MAX_ROW_NNZ; k++) {
-
-			if (k < clamped_nnz) {
-
-				col_idx[base + k] = col_for(row, k);
-				values[base + k] = val_for(row, k);
-
-			} else {
-
-				col_idx[base + k] = 0;
-				values[base + k] = 0.0;
+				const long col = (r * 13 + k * 7) % K;
+				A[r * K + col] = 0.5f + static_cast<float>((r + k) % 11) * 0.2f;
 
 			}
 
 		}
 
-	}
+		const long nnz_b_row = std::min(nnz_b, N);
 
-	return total_nnz;
+		for (long r = 0; r < K; r++) {
 
-}
+			for (long k = 0; k < nnz_b_row; k++) {
 
-int main(int argc, char* argv[]) {
+				const long col = (r * 17 + k * 5) % N;
+				B[r * N + col] = 0.3f + static_cast<float>((r + k) % 7) * 0.15f;
 
-	SPARSE_ROWS = static_cast<int>(parse_arg_long(argc, argv, "rows", 3600));
-	SPARSE_COLS = static_cast<int>(parse_arg_long(argc, argv, "cols", 4096));
-	SPARSE_MAX_ROW_NNZ = static_cast<int>(parse_arg_long(argc, argv, "max-nnz", 240));
-
-	mal_init(MAL_RESIZE_POLICY_AUTO);
-
-	int* row_nnz = nullptr;
-	int* col_idx = nullptr;
-	double* values = nullptr;
-	double* x = nullptr;
-	double* y = nullptr;
-
-	long total_nnz = 0;
-
-	if (mal_rank() == 0) {
-
-		row_nnz = static_cast<int*>(std::malloc(static_cast<size_t>(SPARSE_ROWS) * sizeof(int)));
-		col_idx = static_cast<int*>(std::malloc(static_cast<size_t>(SPARSE_ROWS) * static_cast<size_t>(SPARSE_MAX_ROW_NNZ) * sizeof(int)));
-		values = static_cast<double*>(std::malloc(static_cast<size_t>(SPARSE_ROWS) * static_cast<size_t>(SPARSE_MAX_ROW_NNZ) * sizeof(double)));
-		x = static_cast<double*>(std::malloc(static_cast<size_t>(SPARSE_COLS) * sizeof(double)));
-		y = static_cast<double*>(std::malloc(static_cast<size_t>(SPARSE_ROWS) * sizeof(double)));
-
-		total_nnz = build_sparse_problem(row_nnz, col_idx, values, x);
-
-		#if BENCH_CSV
-
-			(void)total_nnz;
-
-		#endif
-
-		#if !BENCH_CSV
-
-			MAL_LOG(MAL_LOG_INFO, "[SETUP] sparse rows=%d cols=%d max_row_nnz=%d nnz=%ld mode=auto", SPARSE_ROWS, SPARSE_COLS, SPARSE_MAX_ROW_NNZ, total_nnz);
-
-		#endif
-
-	}
-
-	const double t0 = MPI_Wtime();
-	long row, limit;
-	MalFor f = mal_for(SPARSE_ROWS, row, limit);
-
-	#if !BENCH_CSV
-
-		const useconds_t delay_scale_percent = sparse_delay_scale_percent();
-
-	#endif
-
-	mal_attach_mat(f, (void**)&row_nnz, sizeof(int), SPARSE_ROWS, 1, -1, MAL_ATTACH_PARTITIONED, MAL_ATTACH_INHERIT, MAL_ACCESS_READ_ONLY);
-	mal_attach_mat(f, (void**)&col_idx, sizeof(int), SPARSE_ROWS, SPARSE_MAX_ROW_NNZ, -1, MAL_ATTACH_PARTITIONED, MAL_ATTACH_INHERIT, MAL_ACCESS_READ_ONLY);
-	mal_attach_mat(f, (void**)&values, sizeof(double), SPARSE_ROWS, SPARSE_MAX_ROW_NNZ, -1, MAL_ATTACH_PARTITIONED, MAL_ATTACH_INHERIT, MAL_ACCESS_READ_ONLY);
-	mal_attach_mat(f, (void**)&x, sizeof(double), 1, SPARSE_COLS, -1, MAL_ATTACH_SHARED_ACTIVE, MAL_ATTACH_INHERIT, MAL_ACCESS_READ_ONLY);
-	mal_attach_mat(f, (void**)&y, sizeof(double), SPARSE_ROWS, 1, 0, MAL_ATTACH_PARTITIONED);
-
-	for (; row < limit; row++) {
-
-		double acc = 0.0;
-		const int nnz = row_nnz[row];
-		const long base = row * SPARSE_MAX_ROW_NNZ;
-
-		for (int k = 0; k < nnz; k++) {
-
-			acc += values[base + k] * x[col_idx[base + k]];
+			}
 
 		}
 
-		y[row] = acc;
+		#if !BENCH_CSV
+
+			MAL_LOG(MAL_LOG_INFO, "[SETUP] sparse rows=%ld inner=%ld cols=%ld nnz-a=%ld nnz-b=%ld mode=auto", M, K, N, nnz_a, nnz_b);
+
+		#endif
+
+	}
+
+	#if !BENCH_CSV
+
+		float *A_ref = A;
+		float *B_ref = B;
+
+	#endif
+
+	const double t0 = MPI_Wtime();
+	long row, limit;
+	MalFor f = mal_for(M, row, limit);
+
+	#if !BENCH_CSV
+
+		const useconds_t delay_us = example_delay_us(200000);
+
+	#endif
+
+	mal_attach_mat(f, (void**)&A, sizeof(float), M, K, -1, MAL_ATTACH_PARTITIONED);
+	mal_attach_mat(f, (void**)&B, sizeof(float), K, N, -1, MAL_ATTACH_SHARED_ACTIVE);
+	mal_attach_mat(f, (void**)&C, sizeof(float), M, N, 0, MAL_ATTACH_PARTITIONED);
+
+	for (; row < limit; row++) {
+
+		for (long i = 0; i < K; i++) {
+
+			const float a_val = A[row * K + i];
+
+			if (a_val == 0.0f) {
+
+				continue;
+
+			}
+
+			for (long c = 0; c < N; c++) {
+
+				C[row * N + c] += a_val * B[i * N + c];
+
+			}
+
+		}
 
 		#if !BENCH_CSV
 
-			const int delay_ms = 4 + nnz / 2;
-			const useconds_t delay_us = (useconds_t)delay_ms * 1000u * delay_scale_percent / 100u;
-
-			MAL_LOG(MAL_LOG_INFO, "[ITER] row=%ld nnz=%d delay=%dms y=%.6f", row, nnz, delay_ms, acc);
-
+			MAL_LOG(MAL_LOG_INFO, "[ITER] row=%ld", row);
 			usleep(delay_us);
 
 		#endif
@@ -228,73 +121,50 @@ int main(int argc, char* argv[]) {
 
 	if (mal_rank() == 0) {
 
-		int errors = 0;
-		double max_abs_err = 0.0;
-
-		for (long r = 0; r < SPARSE_ROWS; r++) {
-
-			double expected = 0.0;
-			const int nnz = clamped_nnz_for_row(r);
-
-			for (int k = 0; k < nnz; k++) {
-
-				expected += val_for(r, k) * x_val_for_col(col_for(r, k));
-
-			}
-
-			const double err = std::fabs(y[r] - expected);
-			max_abs_err = std::max(max_abs_err, err);
-
-			if (err > 1e-9) {
-
-				errors = 1;
-				break;
-
-			}
-
-		}
-
 		#if BENCH_CSV
 
-			print_bench_csv("sparse", "malleable", "std", mal_size(), SPARSE_ROWS, compute_seconds, errors);
+			print_bench_csv("sparse", "malleable", "std", mal_size(), M, compute_seconds, 0);
 
 		#else
 
-			MAL_LOG(MAL_LOG_INFO, "[RESULT] sparse mat-vec %s (rows=%d cols=%d nnz=%ld errors=%d max_abs_err=%.3e)", errors == 0 ? "OK" : "WRONG", SPARSE_ROWS, SPARSE_COLS, total_nnz, errors, max_abs_err);
+			int errors = 0;
+			float max_err = 0.0f;
+
+			for (long r = 0; r < M && errors == 0; r++) {
+
+				for (long c = 0; c < N; c++) {
+
+					float expected = 0.0f;
+
+					for (long i = 0; i < K; i++) {
+
+						expected += A_ref[r * K + i] * B_ref[i * N + c];
+
+					}
+
+					const float err = std::fabs(C[r * N + c] - expected);
+					max_err = std::max(max_err, err);
+
+					if (err > 1e-3f) {
+
+						errors++;
+						break;
+
+					}
+
+				}
+
+			}
+
+			MAL_LOG(MAL_LOG_INFO, "[RESULT] sparse mat-mat %s (rows=%ld inner=%ld cols=%ld errors=%d max_err=%.3e)", errors == 0 ? "OK" : "WRONG", M, K, N, errors, max_err);
 
 		#endif
 
 	}
 
-	if (row_nnz) {
-
-		std::free(row_nnz);
-
-	}
-
-	if (col_idx) {
-
-		std::free(col_idx);
-
-	}
-
-	if (values) {
-
-		std::free(values);
-
-	}
-
-	if (x) {
-
-		std::free(x);
-
-	}
-
-	if (y) {
-
-		std::free(y);
-
-	}
+	if (A) { std::free(A); }
+	if (B) { std::free(B); }
+	if (C) { std::free(C); }
 
 	return EXIT_SUCCESS;
 

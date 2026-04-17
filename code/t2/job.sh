@@ -1,106 +1,143 @@
 #!/bin/bash
 
-#SBATCH --mem 10G
-#SBATCH -t 00:15:00
-#SBATCH --cpus-per-task=1
+#SBATCH --mem 50G
+#SBATCH -c 5
+#SBATCH -t 01:00:00
 
 set -euo pipefail
 
-CSV=$1
-NPROC=$2
-ITERS=$3
-EXEC=$4
-shift 4
+NPROC=$1
+ITERS=$2
+N_EXECS=$3
+shift 3
+
+EXEC_PATHS=()
+CSV_LIST=()
+
+for ((e = 0; e < N_EXECS; e++)); do
+
+	EXEC_PATHS+=("$1")
+	CSV_LIST+=("$2")
+	shift 2
+
+done
+
+if [[ "${1:-}" == "--" ]]; then
+
+	shift
+
+fi
+
+EXEC_ARGS=("$@")
 
 ITER_TIMEOUT_SEC=${MAL_ITER_TIMEOUT_SEC:-0}
 CONTINUE_ON_ERROR=${MAL_CONTINUE_ON_ERROR:-0}
-BENCH_CSV_MODE=${MAL_BENCH_CSV:-0}
-
-EXEC_NAME=$(basename "$EXEC")
-LOCK="${CSV}.lock"
-OUT_FILE=$(mktemp "${TMPDIR:-/tmp}/malleable_job_output.XXXXXX")
-
-trap 'rm -f "$OUT_FILE"' EXIT
 
 export OMPI_MCA_pml=ob1
 export OMPI_MCA_btl=self,vader,tcp
 
-for i in $(seq 1 "$ITERS"); do
+export MAL_RESIZE_ENABLED=1
+export MAL_MALLEABILITY_ENABLED=1
+export MAL_INITIAL_SIZE=1
+export MAL_AFFINITY=0
+export MAL_EPOCH_INTERVAL_MS=500
+export MAL_LOG_LEVEL=DEBUG
 
-	START_NS=$(date +%s%N)
-	: > "$OUT_FILE"
+run_single() {
+
+	local exec_path="$1"
+	local csv="$2"
+	local iter="$3"
+	local lock="${csv}.lock"
+	local exec_name
+	exec_name=$(basename "$exec_path")
+
+	local out_file
+	out_file=$(mktemp "${TMPDIR:-/tmp}/malleable_job.XXXXXX")
+
+	local exit_code=0
+	local start_ns end_ns elapsed
+
+	start_ns=$(date +%s%N)
 
 	if [[ "$ITER_TIMEOUT_SEC" -gt 0 ]]; then
 
-		if timeout --foreground "${ITER_TIMEOUT_SEC}s" mpirun -np "$NPROC" --mca orte_base_help_aggregate 0 "$EXEC" "$@" 2>&1 | tee "$OUT_FILE"; then
+		if timeout --foreground "${ITER_TIMEOUT_SEC}s" mpirun "$exec_path" "${EXEC_ARGS[@]}" 2>&1 | tee "$out_file"; then
 
-			EXIT_CODE=0
+			exit_code=0
 
 		else
 
-			EXIT_CODE=$?
+			exit_code=$?
 
 		fi
 
 	else
 
-		if mpirun -np "$NPROC" --mca orte_base_help_aggregate 0 "$EXEC" "$@" 2>&1 | tee "$OUT_FILE"; then
+		if mpirun "$exec_path" "${EXEC_ARGS[@]}" 2>&1 | tee "$out_file"; then
 
-			EXIT_CODE=0
+			exit_code=0
 
 		else
 
-			EXIT_CODE=$?
+			exit_code=$?
 
 		fi
 
 	fi
 
-	END_NS=$(date +%s%N)
-	ELAPSED=$(echo "scale=6; ($END_NS - $START_NS) / 1000000000" | bc)
-	BENCH_LINE=$(awk '/^CSV,/{line=$0} END{if (line != "") print line}' "$OUT_FILE")
+	end_ns=$(date +%s%N)
+	elapsed=$(echo "scale=6; ($end_ns - $start_ns) / 1000000000" | bc)
 
-	if [[ -n "$BENCH_LINE" ]]; then
+	local bench_line result_line
+	bench_line=$(awk '/^CSV,/{line=$0} END{if (line != "") print line}' "$out_file")
 
-		RESULT_LINE="${BENCH_LINE#CSV,},${i},${EXIT_CODE}"
+	if [[ -n "$bench_line" ]]; then
+
+		result_line="${bench_line#CSV,},${iter},${exit_code}"
 
 	else
 
-		if [[ "$BENCH_CSV_MODE" -eq 1 ]]; then
-
-			ERRORS_FIELD=0
-
-			if [[ "$EXIT_CODE" -ne 0 ]]; then
-
-				ERRORS_FIELD=1
-
-			fi
-
-			RESULT_LINE="${EXEC_NAME},unknown,unknown,${NPROC},0,${ELAPSED},${ERRORS_FIELD},${i},${EXIT_CODE}"
-
-		else
-
-			RESULT_LINE="${EXEC_NAME},${NPROC},${i},${ELAPSED},${EXIT_CODE}"
-
-		fi
+		result_line="${exec_name},${NPROC},${iter},${elapsed},${exit_code}"
 
 	fi
 
 	(
 		flock 200
-		printf '%s\n' "$RESULT_LINE" >> "$CSV"
-	) 200>"$LOCK"
+		printf '%s\n' "$result_line" >> "$csv"
+	) 200>"$lock"
 
-	if [[ "$EXIT_CODE" -ne 0 ]]; then
+	rm -f "$out_file"
 
-		echo "[JOB] mpirun failed exec=${EXEC_NAME} nproc=${NPROC} iter=${i} exit_code=${EXIT_CODE}" >&2
+	if [[ "$exit_code" -ne 0 ]]; then
 
-		if [[ "$CONTINUE_ON_ERROR" -ne 1 ]]; then
+		echo "[JOB] mpirun failed exec=${exec_name} nproc=${NPROC} iter=${iter} exit_code=${exit_code}" >&2
+		return "$exit_code"
 
-			exit "$EXIT_CODE"
+	fi
+
+	return 0
+
+}
+
+for i in $(seq 1 "$ITERS"); do
+
+	overall_exit=0
+
+	for idx in "${!EXEC_PATHS[@]}"; do
+
+		if ! run_single "${EXEC_PATHS[$idx]}" "${CSV_LIST[$idx]}" "$i"; then
+
+			overall_exit=$?
+
+			if [[ "$CONTINUE_ON_ERROR" -ne 1 ]]; then
+
+				exit "$overall_exit"
+
+			fi
 
 		fi
 
-	fi
+	done
 
 done

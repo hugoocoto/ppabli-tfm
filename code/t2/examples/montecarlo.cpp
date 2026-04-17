@@ -10,7 +10,7 @@ int main(int argc, char* argv[]) {
 	mal_init();
 
 	const long total_points = parse_arg_long(argc, argv, "n", 20);
-	unsigned int seed = static_cast<unsigned int>(mal_rank());
+	unsigned int seed = static_cast<unsigned int>(0);
 	const double t0 = MPI_Wtime();
 
 	long i, limit;

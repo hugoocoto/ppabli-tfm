@@ -2,63 +2,102 @@
 
 set -euo pipefail
 
-EXEC=${1:?"Usage: $0 <executable> [--arg=val ...]"}
-shift
+EXECS=()
+EXEC_ARGS=()
 
-read -ra NPROCS <<< "${MAL_NPROCS:-1 2 4 8 16 32 48 64}"
-ITERS=${MAL_ITERS:-10}
-TASKS_PER_NODE=${MAL_TASKS_PER_NODE:-0}
-BENCH_CSV=${MAL_BENCH_CSV:-0}
-export MAL_BENCH_CSV="$BENCH_CSV"
+for arg in "$@"; do
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CSV="${SCRIPT_DIR}/${EXEC}_data.csv"
+	if [[ "$arg" == "--"* ]]; then
 
-mkdir -p "${SCRIPT_DIR}/out"
-
-if [[ ! -f "$CSV" ]]; then
-
-	if [[ "$BENCH_CSV" -eq 1 ]]; then
-
-		echo "example,variant,mode,np,work_items,compute_seconds,errors,iter,exit_code" > "$CSV"
+		EXEC_ARGS+=("$arg")
 
 	else
 
-		echo "exec,nproc,iter,seconds,exit_code" > "$CSV"
+		EXECS+=("$arg")
 
 	fi
+
+done
+
+if [[ ${#EXECS[@]} -eq 0 ]]; then
+
+	echo "Usage: $0 <exec1> [exec2] [--arg=val ...]" >&2
+	exit 1
 
 fi
 
-module load cesga/2025 gcc/14.3.0 openmpi/5.0.9
-make clean
-make BENCH_CSV="$BENCH_CSV"
+if [[ ${#EXECS[@]} -gt 2 ]]; then
 
-chmod +x "${SCRIPT_DIR}/build/${EXEC}"
+	echo "[ERROR] At most 2 executables supported" >&2
+	exit 1
 
-for nproc in "${NPROCS[@]}"; do
+fi
 
-	if [[ "$nproc" -le 0 ]]; then
+PROCS=(1 2 4 8 16 32 64)
+ITERS=10
 
-		echo "[WARN] Skipping invalid nproc=${nproc}" >&2
-		continue
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+mkdir -p "${SCRIPT_DIR}/out"
+
+CSVS=()
+
+for EXEC in "${EXECS[@]}"; do
+
+	CSV="${SCRIPT_DIR}/${EXEC}_data.csv"
+	CSVS+=("$CSV")
+
+	if [[ -f "$CSV" ]]; then
+
+		rm -f "$CSV"
+		rm -f "${CSV}.lock"
 
 	fi
+
+	if [[ ! -f "$CSV" ]]; then
+
+		echo "exec,version,mode,nproc,n,time,errors,iter,exit_code" > "$CSV"
+
+	fi
+
+done
+
+module load cesga/2025 gcc/14.3.0 openmpi/5.0.9
+#make clean
+#make BENCH_CSV=1
+
+for EXEC in "${EXECS[@]}"; do
+
+	chmod +x "${SCRIPT_DIR}/build/${EXEC}"
+
+done
+
+JOB_LABEL=$(IFS='+'; echo "${EXECS[*]}")
+
+for nproc in "${PROCS[@]}"; do
 
 	SBATCH_ARGS=(
 		-n "$nproc"
-		-J "TFM.${EXEC}.${nproc}"
-		-o "${SCRIPT_DIR}/out/${EXEC}.${nproc}.o"
-		-e "${SCRIPT_DIR}/out/${EXEC}.${nproc}.e"
+		-J "TFM.${JOB_LABEL}.${nproc}"
+		-o "${SCRIPT_DIR}/out/${JOB_LABEL}.${nproc}.o"
+		-e "${SCRIPT_DIR}/out/${JOB_LABEL}.${nproc}.e"
 	)
 
-	if [[ "$TASKS_PER_NODE" -gt 0 ]]; then
+	JOB_ARGS=("$nproc" "$ITERS" "${#EXECS[@]}")
 
-		SBATCH_ARGS+=(--ntasks-per-node "$TASKS_PER_NODE")
+	for idx in "${!EXECS[@]}"; do
+
+		JOB_ARGS+=("${SCRIPT_DIR}/build/${EXECS[$idx]}" "${CSVS[$idx]}")
+
+	done
+
+	if [[ ${#EXEC_ARGS[@]} -gt 0 ]]; then
+
+		JOB_ARGS+=("--" "${EXEC_ARGS[@]}")
 
 	fi
 
-	JOB_ID=$(sbatch --parsable "${SBATCH_ARGS[@]}" "${SCRIPT_DIR}/job.sh" "$CSV" "$nproc" "$ITERS" "${SCRIPT_DIR}/build/${EXEC}" "$@")
-	echo "[SUBMIT] job_id=${JOB_ID} exec=${EXEC} nproc=${nproc} iters=${ITERS}"
+	JOB_ID=$(sbatch --parsable "${SBATCH_ARGS[@]}" "${SCRIPT_DIR}/job.sh" "${JOB_ARGS[@]}")
+	echo "[SUBMIT] job_id=${JOB_ID} execs=${JOB_LABEL} nproc=${nproc} iters=${ITERS}"
 
 done

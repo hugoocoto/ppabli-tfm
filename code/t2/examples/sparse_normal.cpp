@@ -1,293 +1,169 @@
 #include <cstdlib>
 #include <cstdio>
-#include <algorithm>
 #include <cmath>
 #include <vector>
 #include <mpi.h>
 #include "example_utils.hpp"
 
-static int SPARSE_ROWS = 3600;
-static int SPARSE_COLS = 4096;
-static int SPARSE_MAX_ROW_NNZ = 240;
-
-struct BlockRange {
-	long start;
-	long count;
-};
-
-BlockRange block_range(long total, int rank, int size) {
-
-	const long base = total / size;
-	const long rem = total % size;
-	const long count = base + (rank < rem ? 1 : 0);
-	const long start = rank * base + std::min<long>(rank, rem);
-
-	return {start, count};
-
-}
-
-void build_gatherv_layout(long total, int world_size, std::vector<int>& counts, std::vector<int>& displs) {
-
-	counts.resize(world_size);
-	displs.resize(world_size);
-
-	for (int r = 0; r < world_size; r++) {
-
-		const BlockRange rr = block_range(total, r, world_size);
-		counts[r] = static_cast<int>(rr.count);
-		displs[r] = static_cast<int>(rr.start);
-
-	}
-
-}
-
-double x_val_for_col(int col) {
-
-	return 1.0 + static_cast<double>(col % 9) * 0.075;
-
-}
-
-int nnz_for_row(long row) {
-
-	const long block = (row / 36) % 5;
-
-	if (block == 0) {
-
-		return 6 + static_cast<int>(row % 7);
-
-	}
-
-	if (block == 1) {
-
-		return 24 + static_cast<int>(row % 17);
-
-	}
-
-	if (block == 2) {
-
-		return 80 + static_cast<int>(row % 29);
-
-	}
-
-	if (block == 3) {
-
-		return 140 + static_cast<int>((row % 6) * 12);
-
-	}
-
-	if ((row % 4) == 0) {
-
-		return 220;
-
-	}
-
-	return 42 + static_cast<int>(row % 23);
-
-}
-
-int clamped_nnz_for_row(long row) {
-
-	return std::min(nnz_for_row(row), SPARSE_MAX_ROW_NNZ);
-
-}
-
-int stride_for_row(long row) {
-
-	int stride = 17 + static_cast<int>(row % 31);
-	if ((stride % 2) == 0) {
-
-		stride++;
-
-	}
-
-	return stride;
-
-}
-
-int seed_for_row(long row) {
-
-	return static_cast<int>((row * 59 + (row / 9) * 83 + 7) % SPARSE_COLS);
-
-}
-
-int col_for(long row, int k) {
-
-	return (seed_for_row(row) + k * stride_for_row(row) + (k % 5) * 19) % SPARSE_COLS;
-
-}
-
-double val_for(long row, int k) {
-
-	return 0.4 + static_cast<double>((row + k) % 21) * 0.11;
-
-}
-
-long build_sparse_problem(int* row_nnz, int* col_idx, double* values, double* x) {
-
-	for (int c = 0; c < SPARSE_COLS; c++) {
-
-		x[c] = x_val_for_col(c);
-
-	}
-
-	long total_nnz = 0;
-	for (long row = 0; row < SPARSE_ROWS; row++) {
-
-		const int clamped_nnz = clamped_nnz_for_row(row);
-		row_nnz[row] = clamped_nnz;
-		total_nnz += clamped_nnz;
-
-		const long base = row * SPARSE_MAX_ROW_NNZ;
-		for (int k = 0; k < SPARSE_MAX_ROW_NNZ; k++) {
-
-			if (k < clamped_nnz) {
-
-				col_idx[base + k] = col_for(row, k);
-				values[base + k] = val_for(row, k);
-
-			} else {
-
-				col_idx[base + k] = 0;
-				values[base + k] = 0.0;
-
-			}
-
-		}
-
-	}
-
-	return total_nnz;
-
-}
-
 int main(int argc, char* argv[]) {
 
 	MPI_Init(&argc, &argv);
-
-	SPARSE_ROWS = static_cast<int>(parse_arg_long(argc, argv, "rows", 3600));
-	SPARSE_COLS = static_cast<int>(parse_arg_long(argc, argv, "cols", 4096));
-	SPARSE_MAX_ROW_NNZ = static_cast<int>(parse_arg_long(argc, argv, "max-nnz", 240));
 
 	int world_rank = 0;
 	int world_size = 1;
 	MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 	MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
-	int* row_nnz = static_cast<int*>(std::malloc(static_cast<size_t>(SPARSE_ROWS) * sizeof(int)));
-	int* col_idx = static_cast<int*>(std::malloc(static_cast<size_t>(SPARSE_ROWS) * static_cast<size_t>(SPARSE_MAX_ROW_NNZ) * sizeof(int)));
-	double* values = static_cast<double*>(std::malloc(static_cast<size_t>(SPARSE_ROWS) * static_cast<size_t>(SPARSE_MAX_ROW_NNZ) * sizeof(double)));
-	double* x = static_cast<double*>(std::malloc(static_cast<size_t>(SPARSE_COLS) * sizeof(double)));
-	double* y = (world_rank == 0) ? static_cast<double*>(std::malloc(static_cast<size_t>(SPARSE_ROWS) * sizeof(double))) : nullptr;
+	const long M = parse_arg_long(argc, argv, "rows", 1000);
+	const long K = parse_arg_long(argc, argv, "inner", 1000);
+	const long N = parse_arg_long(argc, argv, "cols", 1000);
 
-	long total_nnz = 0;
-	if (world_rank == 0) {
+	const long nnz_a = parse_arg_long(argc, argv, "nnz-a", 500);
+	const long nnz_b = parse_arg_long(argc, argv, "nnz-b", 500);
 
-		total_nnz = build_sparse_problem(row_nnz, col_idx, values, x);
+	if (M % world_size != 0) {
+
+		if (world_rank == 0) {
+
+			std::fprintf(stderr, "[ERROR] rows (%ld) must be divisible by world_size (%d)\n", M, world_size);
+
+		}
+
+		MPI_Finalize();
+		return EXIT_FAILURE;
 
 	}
+
+	const long local_rows = M / world_size;
+
+	std::vector<float> full_A;
+	std::vector<float> B(static_cast<size_t>(K * N), 0.0f);
+	std::vector<float> full_C;
+
+	if (world_rank == 0) {
+
+		full_A.resize(static_cast<size_t>(M * K), 0.0f);
+		full_C.resize(static_cast<size_t>(M * N), 0.0f);
+
+		const long nnz_a_row = std::min(nnz_a, K);
+
+		for (long r = 0; r < M; r++) {
+
+			for (long k = 0; k < nnz_a_row; k++) {
+
+				const long col = (r * 13 + k * 7) % K;
+				full_A[static_cast<size_t>(r * K + col)] = 0.5f + static_cast<float>((r + k) % 11) * 0.2f;
+
+			}
+
+		}
+
+		const long nnz_b_row = std::min(nnz_b, N);
+
+		for (long r = 0; r < K; r++) {
+
+			for (long k = 0; k < nnz_b_row; k++) {
+
+				const long col = (r * 17 + k * 5) % N;
+				B[static_cast<size_t>(r * N + col)] = 0.3f + static_cast<float>((r + k) % 7) * 0.15f;
+
+			}
+
+		}
+
+	}
+
+	std::vector<float> local_A(static_cast<size_t>(local_rows * K));
+	std::vector<float> local_C(static_cast<size_t>(local_rows * N), 0.0f);
 
 	MPI_Barrier(MPI_COMM_WORLD);
 	const double t0 = MPI_Wtime();
 
-	MPI_Bcast(row_nnz, SPARSE_ROWS, MPI_INT, 0, MPI_COMM_WORLD);
-	MPI_Bcast(col_idx, SPARSE_ROWS * SPARSE_MAX_ROW_NNZ, MPI_INT, 0, MPI_COMM_WORLD);
-	MPI_Bcast(values, SPARSE_ROWS * SPARSE_MAX_ROW_NNZ, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-	MPI_Bcast(x, SPARSE_COLS, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-	MPI_Bcast(&total_nnz, 1, MPI_LONG, 0, MPI_COMM_WORLD);
-
-	const BlockRange range = block_range(SPARSE_ROWS, world_rank, world_size);
-	std::vector<double> local_y(static_cast<size_t>(range.count));
+	MPI_Scatter(full_A.data(), static_cast<int>(local_rows * K), MPI_FLOAT, local_A.data(), static_cast<int>(local_rows * K), MPI_FLOAT, 0, MPI_COMM_WORLD);
+	MPI_Bcast(B.data(), static_cast<int>(K * N), MPI_FLOAT, 0, MPI_COMM_WORLD);
 
 	#if !BENCH_CSV
 
-		const useconds_t delay_scale_percent = sparse_delay_scale_percent();
+		const useconds_t delay_us = example_delay_us(200000);
 
 	#endif
 
-	for (long local_i = 0; local_i < range.count; local_i++) {
+	for (long r = 0; r < local_rows; r++) {
 
-		const long row = range.start + local_i;
-		double acc = 0.0;
-		const int nnz = row_nnz[row];
-		const long base = row * SPARSE_MAX_ROW_NNZ;
+		for (long i = 0; i < K; i++) {
 
-		for (int k = 0; k < nnz; k++) {
+			const float a_val = local_A[static_cast<size_t>(r * K + i)];
 
-			acc += values[base + k] * x[col_idx[base + k]];
+			if (a_val == 0.0f) {
+
+				continue;
+
+
+			}
+
+			for (long c = 0; c < N; c++) {
+
+				local_C[static_cast<size_t>(r * N + c)] += a_val * B[static_cast<size_t>(i * N + c)];
+
+			}
 
 		}
 
-		local_y[static_cast<size_t>(local_i)] = acc;
-
 		#if !BENCH_CSV
 
-			const int delay_ms = 4 + nnz / 2;
-			const useconds_t delay_us = static_cast<useconds_t>(delay_ms) * 1000u * delay_scale_percent / 100u;
 			usleep(delay_us);
 
 		#endif
 
 	}
 
-	std::vector<int> recv_counts;
-	std::vector<int> recv_displs;
-	if (world_rank == 0) {
+	MPI_Gather(local_C.data(), static_cast<int>(local_rows * N), MPI_FLOAT, full_C.data(), static_cast<int>(local_rows * N), MPI_FLOAT, 0, MPI_COMM_WORLD);
 
-		build_gatherv_layout(SPARSE_ROWS, world_size, recv_counts, recv_displs);
-
-	}
-
-	MPI_Gatherv(local_y.data(), static_cast<int>(range.count), MPI_DOUBLE, y, (world_rank == 0) ? recv_counts.data() : nullptr, (world_rank == 0) ? recv_displs.data() : nullptr, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-
-	MPI_Barrier(MPI_COMM_WORLD);
 	const double t1 = MPI_Wtime();
 
 	if (world_rank == 0) {
 
-		int errors = 0;
-		double max_abs_err = 0.0;
-
-		for (long r = 0; r < SPARSE_ROWS; r++) {
-
-			double expected = 0.0;
-			const int nnz = clamped_nnz_for_row(r);
-
-			for (int k = 0; k < nnz; k++) {
-
-				expected += val_for(r, k) * x_val_for_col(col_for(r, k));
-
-			}
-
-			const double err = std::fabs(y[r] - expected);
-			max_abs_err = std::max(max_abs_err, err);
-
-			if (err > 1e-9) {
-
-				errors = 1;
-				break;
-
-			}
-
-		}
-
 		#if BENCH_CSV
 
-			print_bench_csv("sparse", "normal", "std", world_size, SPARSE_ROWS, t1 - t0, errors);
+			print_bench_csv("sparse", "normal", "std", world_size, M, t1 - t0, 0);
 
 		#else
 
-			std::printf("[RESULT] sparse mat-vec %s (rows=%d cols=%d nnz=%ld errors=%d max_abs_err=%.3e)\n", errors == 0 ? "OK" : "WRONG", SPARSE_ROWS, SPARSE_COLS, total_nnz, errors, max_abs_err);
+			int errors = 0;
+			float max_err = 0.0f;
+
+			for (long r = 0; r < M && errors == 0; r++) {
+
+				for (long c = 0; c < N; c++) {
+
+					float expected = 0.0f;
+
+					for (long i = 0; i < K; i++) {
+
+						expected += full_A[static_cast<size_t>(r * K + i)] * B[static_cast<size_t>(i * N + c)];
+
+					}
+
+					const float err = std::fabs(full_C[static_cast<size_t>(r * N + c)] - expected);
+					max_err = std::max(max_err, err);
+
+					if (err > 1e-3f) {
+
+						errors++;
+						break;
+
+					}
+
+				}
+
+			}
+
+			std::printf("[RESULT] sparse mat-mat %s (M=%ld K=%ld N=%ld errors=%d max_err=%.3e)\n", errors == 0 ? "OK" : "WRONG", M, K, N, errors, max_err);
 			std::printf("[TIME] sparse normal mpi np=%d seconds=%.6f\n", world_size, t1 - t0);
 
 		#endif
-		std::free(y);
 
 	}
-
-	std::free(row_nnz);
-	std::free(col_idx);
-	std::free(values);
-	std::free(x);
 
 	MPI_Finalize();
 	return EXIT_SUCCESS;

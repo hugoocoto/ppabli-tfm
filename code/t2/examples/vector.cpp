@@ -1,5 +1,6 @@
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <mpi.h>
 #include "malleable.hpp"
 #include "example_utils.hpp"
@@ -16,18 +17,18 @@ int main(int argc, char* argv[]) {
 	const long total_n = use_collapse ? (collapse_rows * collapse_cols) : mal_n;
 	double compute_seconds = 0.0;
 
-	double *A = nullptr, *B = nullptr, *C = nullptr;
+	float *A = nullptr, *B = nullptr, *C = nullptr;
 
 	if (mal_rank() == 0) {
 
-		A = static_cast<double*>(std::malloc(static_cast<size_t>(total_n) * sizeof(double)));
-		B = static_cast<double*>(std::malloc(static_cast<size_t>(total_n) * sizeof(double)));
-		C = static_cast<double*>(std::malloc(static_cast<size_t>(total_n) * sizeof(double)));
+		A = static_cast<float*>(std::malloc(static_cast<size_t>(total_n) * sizeof(float)));
+		B = static_cast<float*>(std::malloc(static_cast<size_t>(total_n) * sizeof(float)));
+		C = static_cast<float*>(std::malloc(static_cast<size_t>(total_n) * sizeof(float)));
 
 		for (long k = 0; k < total_n; k++) {
 
-			A[k] = static_cast<double>(k + 1);
-			B[k] = static_cast<double>(total_n - k);
+			A[k] = static_cast<float>(k + 1);
+			B[k] = static_cast<float>(total_n - k);
 
 		}
 
@@ -46,9 +47,9 @@ int main(int argc, char* argv[]) {
 
 		MalForND nd = mal_for_nd_begin(iters, loop_limits, starts, limits2d, 2);
 
-		mal_attach_vec(nd, (void**)&A, sizeof(double), total_n, -1);
-		mal_attach_vec(nd, (void**)&B, sizeof(double), total_n, -1);
-		mal_attach_vec(nd, (void**)&C, sizeof(double), total_n, 0);
+		mal_attach_vec(nd, (void**)&A, sizeof(float), total_n, -1);
+		mal_attach_vec(nd, (void**)&B, sizeof(float), total_n, -1);
+		mal_attach_vec(nd, (void**)&C, sizeof(float), total_n, 0);
 
 		#if !BENCH_CSV
 
@@ -61,11 +62,19 @@ int main(int argc, char* argv[]) {
 			for (; j < limit_cols; j++) {
 
 				long idx = i * limit_cols + j;
-				C[idx] = A[idx] + B[idx];
+				float acc = 0.0f;
+
+				for (int iter = 0; iter < 1000; iter++) {
+
+					acc += std::sin(A[idx]) * std::cos(B[idx]) + std::sqrt(A[idx] * B[idx]);
+
+				}
+
+				C[idx] = acc;
 
 				#if !BENCH_CSV
 
-					MAL_LOG(MAL_LOG_INFO, "[ITER] C[%ld] = %.1f + %.1f = %.1f", idx, A[idx], B[idx], C[idx]);
+					MAL_LOG(MAL_LOG_INFO, "[ITER] C[%ld] = %.6f", idx, C[idx]);
 					usleep(delay_us);
 
 				#endif
@@ -86,9 +95,9 @@ int main(int argc, char* argv[]) {
 
 		MalFor f = mal_for(mal_n, i, limit);
 
-		mal_attach_vec(f, (void**)&A, sizeof(double), mal_n, -1);
-		mal_attach_vec(f, (void**)&B, sizeof(double), mal_n, -1);
-		mal_attach_vec(f, (void**)&C, sizeof(double), mal_n, 0);
+		mal_attach_vec(f, (void**)&A, sizeof(float), mal_n, -1);
+		mal_attach_vec(f, (void**)&B, sizeof(float), mal_n, -1);
+		mal_attach_vec(f, (void**)&C, sizeof(float), mal_n, 0);
 
 		#if !BENCH_CSV
 
@@ -98,11 +107,19 @@ int main(int argc, char* argv[]) {
 
 		for (; i < limit; i++) {
 
-			C[i] = A[i] + B[i];
+			float acc = 0.0f;
+
+			for (int iter = 0; iter < 1000; iter++) {
+
+				acc += std::sin(A[i]) * std::cos(B[i]) + std::sqrt(A[i] * B[i]);
+
+			}
+
+			C[i] = acc;
 
 			#if !BENCH_CSV
 
-				MAL_LOG(MAL_LOG_INFO, "[ITER] C[%ld] = %.1f + %.1f = %.1f", i, A[i], B[i], C[i]);
+				MAL_LOG(MAL_LOG_INFO, "[ITER] C[%ld] = %.6f", i, C[i]);
 				usleep(delay_us);
 
 			#endif
@@ -128,7 +145,11 @@ int main(int argc, char* argv[]) {
 
 		for (long k = 0; k < total_n; k++) {
 
-			if (C[k] != static_cast<double>(total_n + 1)) {
+			const float ak = static_cast<float>(k + 1);
+			const float bk = static_cast<float>(total_n - k);
+			const float expected = (std::sin(ak) * std::cos(bk) + std::sqrt(ak * bk)) * 1000.0f;
+
+			if (std::fabs(C[k] - expected) > std::fabs(expected) * 1e-3f + 1e-3f) {
 
 				errors++;
 				break;

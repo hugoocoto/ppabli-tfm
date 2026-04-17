@@ -31,7 +31,7 @@ int main(int argc, char* argv[]) {
 	MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
 	const long total_points = parse_arg_long(argc, argv, "n", 20);
-	unsigned int seed = static_cast<unsigned int>(world_rank);
+	unsigned int seed = static_cast<unsigned int>(0);
 	const BlockRange range = block_range(total_points, world_rank, world_size);
 
 	#if !BENCH_CSV
@@ -66,7 +66,6 @@ int main(int argc, char* argv[]) {
 	long hits = 0;
 	MPI_Reduce(&local_hits, &hits, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
 
-	MPI_Barrier(MPI_COMM_WORLD);
 	const double t1 = MPI_Wtime();
 
 	if (world_rank == 0) {
