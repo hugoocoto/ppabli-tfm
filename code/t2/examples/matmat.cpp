@@ -9,9 +9,9 @@ int main(int argc, char* argv[]) {
 
 	mal_init();
 
-	const long M = parse_arg_long(argc, argv, "m", 12);
-	const long K = parse_arg_long(argc, argv, "k", 6);
-	const long N = parse_arg_long(argc, argv, "n", 4);
+	const long M = parse_arg_long(argc, argv, "m", 120);
+	const long K = parse_arg_long(argc, argv, "k", 60);
+	const long N = parse_arg_long(argc, argv, "n", 40);
 
 	float *A = nullptr, *B = nullptr, *C = nullptr;
 
@@ -49,9 +49,9 @@ int main(int argc, char* argv[]) {
 
 	#endif
 
-	mal_attach_mat(f, (void**)&A, sizeof(float), M, K, -1, MAL_ATTACH_PARTITIONED);
-	mal_attach_mat(f, (void**)&B, sizeof(float), K, N, -1, MAL_ATTACH_SHARED_ACTIVE);
-	mal_attach_mat(f, (void**)&C, sizeof(float), M, N, 0, MAL_ATTACH_PARTITIONED);
+	mal_attach_mat(f, (void**)&A, sizeof(float), M, K, -1);
+	mal_attach_mat(f, (void**)&B, sizeof(float), K, N, -1, MAL_ATTACH_SHARED_ALL, MAL_ATTACH_INHERIT, MAL_ACCESS_READ_ONLY);
+	mal_attach_mat(f, (void**)&C, sizeof(float), M, N, 0);
 
 	for (; i < lim; i++) {
 
@@ -91,30 +91,30 @@ int main(int argc, char* argv[]) {
 
 	if (mal_rank() == 0) {
 
-		int errors = 0;
+		#if BENCH_CSV
 
-		for (long r = 0; r < M && errors == 0; r++) {
+			print_bench_csv("matmat", "malleable", "mm", mal_size(), M * N, compute_seconds, 0);
 
-			const float expected = static_cast<float>(r + 1) * static_cast<float>(K);
+		#else
 
-			for (long c = 0; c < N; c++) {
+			int errors = 0;
 
-				if (std::fabs(C[r * N + c] - expected) > 1e-3f) {
+			for (long r = 0; r < M && errors == 0; r++) {
 
-					errors = 1;
-					break;
+				const float expected = static_cast<float>(r + 1) * static_cast<float>(K);
+
+				for (long c = 0; c < N; c++) {
+
+					if (std::fabs(C[r * N + c] - expected) > 1e-3f) {
+
+						errors = 1;
+						break;
+
+					}
 
 				}
 
 			}
-
-		}
-
-		#if BENCH_CSV
-
-			print_bench_csv("matmat", "malleable", "mm", mal_size(), M * N, compute_seconds, errors);
-
-		#else
 
 			MAL_LOG(MAL_LOG_INFO, "[RESULT] mat-mat %s (%d errors)", errors == 0 ? "OK" : "WRONG", errors);
 

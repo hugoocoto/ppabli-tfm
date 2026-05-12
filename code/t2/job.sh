@@ -38,10 +38,14 @@ export OMPI_MCA_btl=self,vader,tcp
 
 export MAL_RESIZE_ENABLED=1
 export MAL_MALLEABILITY_ENABLED=1
+export MAL_LOAD_BALANCING_ENABLED=1
 export MAL_INITIAL_SIZE=1
 export MAL_AFFINITY=0
-export MAL_EPOCH_INTERVAL_MS=500
+export MAL_EPOCH_INTERVAL_MS=100
 export MAL_LOG_LEVEL=DEBUG
+export MAL_EPOCH_CHANGE_MODE=1
+export MAL_TIMING=0
+export MAL_LOG_ALL_RANKS=0
 
 run_single() {
 
@@ -52,45 +56,29 @@ run_single() {
 	local exec_name
 	exec_name=$(basename "$exec_path")
 
-	local out_file
-	out_file=$(mktemp "${TMPDIR:-/tmp}/malleable_job.XXXXXX")
-
 	local exit_code=0
 	local start_ns end_ns elapsed
+	local output=""
 
 	start_ns=$(date +%s%N)
 
 	if [[ "$ITER_TIMEOUT_SEC" -gt 0 ]]; then
 
-		if timeout --foreground "${ITER_TIMEOUT_SEC}s" mpirun "$exec_path" "${EXEC_ARGS[@]}" 2>&1 | tee "$out_file"; then
-
-			exit_code=0
-
-		else
-
-			exit_code=$?
-
-		fi
+		output=$(timeout --foreground "${ITER_TIMEOUT_SEC}s" mpirun "$exec_path" "${EXEC_ARGS[@]}" 2>&1) || exit_code=$?
 
 	else
 
-		if mpirun "$exec_path" "${EXEC_ARGS[@]}" 2>&1 | tee "$out_file"; then
-
-			exit_code=0
-
-		else
-
-			exit_code=$?
-
-		fi
+		output=$(mpirun "$exec_path" "${EXEC_ARGS[@]}" 2>&1) || exit_code=$?
 
 	fi
 
 	end_ns=$(date +%s%N)
 	elapsed=$(echo "scale=6; ($end_ns - $start_ns) / 1000000000" | bc)
 
+	printf '%s\n' "$output"
+
 	local bench_line result_line
-	bench_line=$(awk '/^CSV,/{line=$0} END{if (line != "") print line}' "$out_file")
+	bench_line=$(printf '%s\n' "$output" | awk '/^CSV,/{line=$0} END{if (line != "") print line}')
 
 	if [[ -n "$bench_line" ]]; then
 
@@ -106,8 +94,6 @@ run_single() {
 		flock 200
 		printf '%s\n' "$result_line" >> "$csv"
 	) 200>"$lock"
-
-	rm -f "$out_file"
 
 	if [[ "$exit_code" -ne 0 ]]; then
 
@@ -126,7 +112,11 @@ for i in $(seq 1 "$ITERS"); do
 
 	for idx in "${!EXEC_PATHS[@]}"; do
 
+		echo "[JOB] Starting iteration $i for exec=${EXEC_PATHS[$idx]}" >&2
+
 		if ! run_single "${EXEC_PATHS[$idx]}" "${CSV_LIST[$idx]}" "$i"; then
+
+			echo "[JOB] Iteration $i failed for exec=${EXEC_PATHS[$idx]}" >&2
 
 			overall_exit=$?
 

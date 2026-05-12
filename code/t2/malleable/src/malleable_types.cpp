@@ -96,8 +96,11 @@ struct TransferPlanEntry {
 class BufferPool {
 
 	static constexpr int kTLCacheSlots = 16;
+
+public:
 	static constexpr size_t kSmallAllocThreshold = 256;
 
+private:
 	struct Entry {
 		void* ptr;
 		size_t capacity;
@@ -155,6 +158,8 @@ class BufferPool {
 
 	}
 
+public:
+
 	static size_t bucket_key(size_t bytes) noexcept {
 
 		if (bytes <= 1) {
@@ -167,7 +172,6 @@ class BufferPool {
 
 	}
 
-public:
 
 	~BufferPool() {
 
@@ -399,6 +403,7 @@ struct MalState {
 
 	struct Config {
 
+		// sequence: written only pre-mal_init via load_resize_sequence_or_abort; never resized after worker thread starts. seq_idx: single-writer (worker thread) post-init.
 		std::vector<int> sequence;
 		std::atomic<size_t> seq_idx{0};
 		MalResizePolicy resize_policy{MAL_RESIZE_POLICY_AUTO};
@@ -447,7 +452,7 @@ struct MalState {
 
 			{
 				std::lock_guard lk(mu);
-				compute_ready.store(true, std::memory_order_relaxed);
+				compute_ready.store(true, std::memory_order_release);
 			}
 
 			cv.notify_one();
@@ -456,10 +461,9 @@ struct MalState {
 
 				std::unique_lock lk(mu);
 				cv.wait(lk, ready);
+				compute_ready.store(false, std::memory_order_release);
 
 			}
-
-			compute_ready.store(false, std::memory_order_relaxed);
 
 		}
 
@@ -467,7 +471,7 @@ struct MalState {
 
 			std::unique_lock lk(mu);
 
-			while (!compute_ready.load(std::memory_order_relaxed) && !stop.load(std::memory_order_relaxed)) {
+			while (!compute_ready.load(std::memory_order_acquire) && !stop.load(std::memory_order_acquire)) {
 
 				cv.wait(lk);
 
@@ -528,6 +532,7 @@ struct MalState {
 	struct LoadBalance {
 
 		std::vector<double> weights;
+		mutable std::mutex weights_mu;
 		double epoch_start_time{0.0};
 		long epoch_assigned{0};
 		double alpha{0.3};
@@ -1144,6 +1149,7 @@ void pool_reserve(void*& ptr, size_t& capacity, size_t min_bytes, bool preserve_
 	}
 
 	void* nb = g_buffer_pool.acquire(need);
+	const size_t new_capacity = (need > BufferPool::kSmallAllocThreshold) ? BufferPool::bucket_key(need) : need;
 
 	if (ptr) {
 
@@ -1164,7 +1170,7 @@ void pool_reserve(void*& ptr, size_t& capacity, size_t min_bytes, bool preserve_
 	}
 
 	ptr = nb;
-	capacity = need;
+	capacity = new_capacity;
 
 }
 
@@ -1973,7 +1979,6 @@ void distribute(long total, int nprocs, int rank, long& start, long& end) noexce
 
 std::vector<long> build_partition_cuts(long total, int nprocs) {
 
-	const auto& w = g.lb.weights;
 	std::vector<long> cuts((size_t)std::max(0, nprocs) + 1, 0);
 	const bool lb_enabled = g.cfg.load_balancing_enabled.load(std::memory_order_relaxed);
 
@@ -1992,6 +1997,15 @@ std::vector<long> build_partition_cuts(long total, int nprocs) {
 		}
 
 		return cuts;
+
+	}
+
+	std::vector<double> w;
+
+	{
+
+		std::lock_guard<std::mutex> lk(g.lb.weights_mu);
+		w = g.lb.weights;
 
 	}
 
@@ -2403,13 +2417,15 @@ std::vector<std::pair<long,long>> slice_remaining(const std::vector<std::pair<lo
 	std::vector<std::pair<long,long>> out;
 	out.reserve(remaining.size());
 
-	if (remaining.empty() || vend <= vstart) {
+	if (remaining.empty() || vend <= vstart || offsets.empty()) {
 
 		return out;
 
 	}
 
-	size_t idx = (size_t)std::distance(offsets.begin(), std::upper_bound(offsets.begin(), offsets.end(), vstart)) - 1;
+	auto ub = std::upper_bound(offsets.begin(), offsets.end(), vstart);
+	size_t ub_dist = (size_t)std::distance(offsets.begin(), ub);
+	size_t idx = (ub_dist == 0) ? 0 : ub_dist - 1;
 	long offset = offsets[idx];
 
 	for (; idx < remaining.size(); idx++) {

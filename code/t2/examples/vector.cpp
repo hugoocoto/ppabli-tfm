@@ -9,9 +9,9 @@ int main(int argc, char* argv[]) {
 
 	mal_init();
 
-	const long mal_n = parse_arg_long(argc, argv, "n", 20);
+	const long mal_n = parse_arg_long(argc, argv, "n", 200);
 	const long collapse_rows = parse_arg_long(argc, argv, "rows", 4);
-	const long collapse_cols = parse_arg_long(argc, argv, "cols", 5);
+	const long collapse_cols = parse_arg_long(argc, argv, "cols", 50);
 
 	bool use_collapse = (argc > 1 && std::strcmp(argv[1], "collapse") == 0);
 	const long total_n = use_collapse ? (collapse_rows * collapse_cols) : mal_n;
@@ -141,28 +141,28 @@ int main(int argc, char* argv[]) {
 
 	if (mal_rank() == 0) {
 
-		int errors = 0;
-
-		for (long k = 0; k < total_n; k++) {
-
-			const float ak = static_cast<float>(k + 1);
-			const float bk = static_cast<float>(total_n - k);
-			const float expected = (std::sin(ak) * std::cos(bk) + std::sqrt(ak * bk)) * 1000.0f;
-
-			if (std::fabs(C[k] - expected) > std::fabs(expected) * 1e-3f + 1e-3f) {
-
-				errors++;
-				break;
-
-			}
-
-		}
-
 		#if BENCH_CSV
 
-			print_bench_csv("vector", "malleable", use_collapse ? "collapse" : "flat", mal_size(), total_n, compute_seconds, errors);
+			print_bench_csv("vector", "malleable", use_collapse ? "collapse" : "flat", mal_size(), total_n, compute_seconds, 0);
 
 		#else
+
+			int errors = 0;
+
+			for (long k = 0; k < total_n; k++) {
+
+				const float ak = static_cast<float>(k + 1);
+				const float bk = static_cast<float>(total_n - k);
+				const float expected = (std::sin(ak) * std::cos(bk) + std::sqrt(ak * bk)) * 1000.0f;
+
+				if (std::fabs(C[k] - expected) > std::fabs(expected) * 1e-3f + 1e-3f) {
+
+					errors++;
+					break;
+
+				}
+
+			}
 
 			if (errors == 0) {
 

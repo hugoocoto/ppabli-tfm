@@ -2,14 +2,26 @@ CXX = mpicxx
 AR = ar
 MPIRUN = mpirun
 
-NP = 4
+NP = 8
 BENCH_CSV ?= 0
+TEST_RUNS ?= 10
 
 USE_PAPI ?= 0
 PAPI_PREFIX ?= $(HOME)/Desktop/papi/src/install
 
 CXXFLAGS = -O2 -march=native -Wall -std=c++20 -Imalleable/include -DBENCH_CSV=$(BENCH_CSV)
 LIBS = -lpthread
+
+export MAL_RESIZE_ENABLED=1
+export MAL_MALLEABILITY_ENABLED=1
+export MAL_LOAD_BALANCING_ENABLED=1
+export MAL_INITIAL_SIZE=1
+export MAL_AFFINITY=0
+export MAL_EPOCH_INTERVAL_MS=100
+export MAL_LOG_LEVEL=DEBUG
+export MAL_EPOCH_CHANGE_MODE=1
+export MAL_TIMING=0
+export MAL_LOG_ALL_RANKS=1
 
 ifeq ($(USE_PAPI), 1)
 
@@ -44,6 +56,10 @@ TARGET_SP = $(BUILD_DIR)/sparse
 SRCS_SP = examples/sparse.cpp
 OBJS_SP = $(SRCS_SP:%.cpp=$(BUILD_DIR)/%.o)
 
+TARGET_RD = $(BUILD_DIR)/resize_demo
+SRCS_RD = examples/resize_demo.cpp
+OBJS_RD = $(SRCS_RD:%.cpp=$(BUILD_DIR)/%.o)
+
 TARGET_MC_NORMAL = $(BUILD_DIR)/montecarlo_normal
 SRCS_MC_NORMAL = examples/montecarlo_normal.cpp
 OBJS_MC_NORMAL = $(SRCS_MC_NORMAL:%.cpp=$(BUILD_DIR)/%.o)
@@ -64,15 +80,11 @@ TARGET_SP_NORMAL = $(BUILD_DIR)/sparse_normal
 SRCS_SP_NORMAL = examples/sparse_normal.cpp
 OBJS_SP_NORMAL = $(SRCS_SP_NORMAL:%.cpp=$(BUILD_DIR)/%.o)
 
-DEPS = $(LIB_OBJS:.o=.d) $(OBJS_MC:.o=.d) $(OBJS_VEC:.o=.d) $(OBJS_MAT:.o=.d) $(OBJS_MV:.o=.d) $(OBJS_SP:.o=.d) \
-	$(OBJS_MC_NORMAL:.o=.d) $(OBJS_VEC_NORMAL:.o=.d) $(OBJS_MM_NORMAL:.o=.d) $(OBJS_MV_NORMAL:.o=.d) $(OBJS_SP_NORMAL:.o=.d)
+DEPS = $(LIB_OBJS:.o=.d) $(OBJS_MC:.o=.d) $(OBJS_VEC:.o=.d) $(OBJS_MAT:.o=.d) $(OBJS_MV:.o=.d) $(OBJS_SP:.o=.d) $(OBJS_RD:.o=.d) $(OBJS_MC_NORMAL:.o=.d) $(OBJS_VEC_NORMAL:.o=.d) $(OBJS_MM_NORMAL:.o=.d) $(OBJS_MV_NORMAL:.o=.d) $(OBJS_SP_NORMAL:.o=.d)
 
-.PHONY: all run_montecarlo run_vector run_vector_collapse run_matmat run_matvec run_sparse \
-	run_montecarlo_normal run_vector_normal run_vector_normal_collapse run_matmat_normal run_matvec_normal run_sparse_normal \
-	test clean re
+.PHONY: all run_montecarlo run_vector run_vector_collapse run_matmat run_matvec run_sparse run_montecarlo_normal run_vector_normal run_vector_normal_collapse run_matmat_normal run_matvec_normal run_sparse_normal test clean re
 
-all: $(LIB_MAL) $(TARGET_MC) $(TARGET_VEC) $(TARGET_MAT) $(TARGET_MV) $(TARGET_SP) \
-	$(TARGET_MC_NORMAL) $(TARGET_VEC_NORMAL) $(TARGET_MM_NORMAL) $(TARGET_MV_NORMAL) $(TARGET_SP_NORMAL)
+all: $(LIB_MAL) $(TARGET_MC) $(TARGET_VEC) $(TARGET_MAT) $(TARGET_MV) $(TARGET_SP) $(TARGET_RD) $(TARGET_MC_NORMAL) $(TARGET_VEC_NORMAL) $(TARGET_MM_NORMAL) $(TARGET_MV_NORMAL) $(TARGET_SP_NORMAL)
 
 $(LIB_MAL): Makefile $(LIB_OBJS)
 	@mkdir -p $(dir $@)
@@ -93,6 +105,9 @@ $(TARGET_MV): $(LIB_MAL) $(OBJS_MV)
 
 $(TARGET_SP): $(LIB_MAL) $(OBJS_SP)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_SP) $(LIB_MAL) $(LIBS)
+
+$(TARGET_RD): $(LIB_MAL) $(OBJS_RD)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_RD) $(LIB_MAL) $(LIBS)
 
 $(TARGET_MC_NORMAL): $(OBJS_MC_NORMAL)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_MC_NORMAL) $(LIBS)
@@ -131,6 +146,9 @@ run_matvec: $(TARGET_MV)
 run_sparse: $(TARGET_SP)
 	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_SP)
 
+run_resize_demo: $(TARGET_RD)
+	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_RD)
+
 run_montecarlo_normal: $(TARGET_MC_NORMAL)
 	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_MC_NORMAL)
 
@@ -150,17 +168,41 @@ run_sparse_normal: $(TARGET_SP_NORMAL)
 	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_SP_NORMAL)
 
 test: all
-	@out=`$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_VEC) 2>&1`; \
-	echo "$$out" | grep -q "\[RESULT\] vector OK" && echo "TEST vector OK" || { echo "TEST vector FAIL"; exit 1; }
-	@out=`$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_VEC) collapse 2>&1`; \
-	echo "$$out" | grep -q "\[RESULT\] vector OK" && echo "TEST vector collapse OK" || { echo "TEST vector collapse FAIL"; exit 1; }
-	@out=`$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_MV) 2>&1`; \
-	echo "$$out" | grep -q "\[RESULT\] mat-vec OK" && echo "TEST matvec OK" || { echo "TEST matvec FAIL"; exit 1; }
-	@out=`$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_MAT) 2>&1`; \
-	echo "$$out" | grep -q "\[RESULT\] mat-mat OK" && echo "TEST matmat OK" || { echo "TEST matmat FAIL"; exit 1; }
-	@out=`$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_MC) 2>&1`; \
-	echo "$$out" | grep -q "\[RESULT\] montecarlo OK" && echo "TEST montecarlo OK" || { echo "TEST montecarlo FAIL"; exit 1; }
-	@echo "TEST ALL OK"
+	@total=$(TEST_RUNS); pass=0; fail=0; \
+	for iter in $$(seq 1 $$total); do \
+		echo ""; \
+		echo "=== Iteration $$iter/$$total ==="; \
+		iter_ok=1; \
+		out=`$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_VEC) 2>&1`; \
+		echo "$$out" | grep -q "\[RESULT\] vector OK" && echo "  [OK] vector" || { echo "  [FAIL] vector"; iter_ok=0; }; \
+		out=`$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_VEC) collapse 2>&1`; \
+		echo "$$out" | grep -q "\[RESULT\] vector OK" && echo "  [OK] vector collapse" || { echo "  [FAIL] vector collapse"; iter_ok=0; }; \
+		out=`$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_MV) 2>&1`; \
+		echo "$$out" | grep -q "\[RESULT\] mat-vec OK" && echo "  [OK] matvec" || { echo "  [FAIL] matvec"; iter_ok=0; }; \
+		out=`$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_MAT) 2>&1`; \
+		echo "$$out" | grep -q "\[RESULT\] mat-mat OK" && echo "  [OK] matmat" || { echo "  [FAIL] matmat"; iter_ok=0; }; \
+		out=`$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_MC) 2>&1`; \
+		echo "$$out" | grep -q "\[RESULT\] montecarlo OK" && echo "  [OK] montecarlo" || { echo "  [FAIL] montecarlo"; iter_ok=0; }; \
+		if [ $$iter_ok -eq 1 ]; then \
+			pass=$$((pass+1)); echo "  => PASSED"; \
+		else \
+			fail=$$((fail+1)); echo "  => FAILED"; \
+		fi; \
+	done; \
+	echo ""; \
+	echo "============================================"; \
+	echo "  SUMMARY  ($$total iterations)"; \
+	echo "--------------------------------------------"; \
+	echo "  Passed : $$pass / $$total"; \
+	echo "  Failed : $$fail / $$total"; \
+	echo "============================================"; \
+	if [ $$fail -eq 0 ]; then \
+		echo "  RESULT : ALL ITERATIONS OK"; \
+	else \
+		echo "  RESULT : $$fail ITERATION(S) FAILED"; \
+	fi; \
+	echo "============================================"; \
+	[ $$fail -eq 0 ]
 
 re: clean all
 

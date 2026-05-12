@@ -54,6 +54,39 @@ constexpr double kStaticW = MAL_PAPI_STATIC_W;
 constexpr double kDynNJPerCyc = MAL_PAPI_DYN_NJ_PER_CYC;
 constexpr double kMemNJPerMiss = MAL_PAPI_MEM_NJ_PER_MISS;
 
+double g_papi_miss_penalty_cycles = MAL_PAPI_MISS_PENALTY_CYCLES;
+double g_papi_mem_bound_ooo_correction = MAL_PAPI_MEM_BOUND_OOO_CORRECTION;
+
+inline void papi_load_env_overrides() {
+
+	if (const char* v = std::getenv("MAL_PAPI_MISS_PENALTY_CYCLES")) {
+
+		char* end = nullptr;
+		double val = std::strtod(v, &end);
+
+		if (end != v && val > 0.0) {
+
+			g_papi_miss_penalty_cycles = val;
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_PAPI_MEM_BOUND_OOO_CORRECTION")) {
+
+		char* end = nullptr;
+		double val = std::strtod(v, &end);
+
+		if (end != v && val >= 0.0 && val <= 1.0) {
+
+			g_papi_mem_bound_ooo_correction = val;
+
+		}
+
+	}
+
+}
+
 #ifdef MAL_USE_PAPI
 
 	constexpr int kPapiEventCodes[kNumPapiEvents] = {
@@ -67,6 +100,8 @@ constexpr double kMemNJPerMiss = MAL_PAPI_MEM_NJ_PER_MISS;
 	bool g_papi_available = false;
 
 	void papi_init() {
+
+		papi_load_env_overrides();
 
 		int ret = PAPI_library_init(PAPI_VER_CURRENT);
 
@@ -200,7 +235,7 @@ double papi_energy_nJ(const long long vals[kNumPapiEvents]) {
 	const double t_wall_s = (refc > 0) ? (double)refc / kRefFreqHz : 0.0;
 	const double e_static = kStaticW * t_wall_s * 1e9;
 
-	const double stall_cyc = (double)std::max(0LL, llc) * MAL_PAPI_MISS_PENALTY_CYCLES * MAL_PAPI_MEM_BOUND_OOO_CORRECTION;
+	const double stall_cyc = (double)std::max(0LL, llc) * g_papi_miss_penalty_cycles * g_papi_mem_bound_ooo_correction;
 	const double active_cyc = std::max(0.0, (double)cyc - stall_cyc);
 	const double e_dynamic = kDynNJPerCyc * active_cyc;
 	const double e_memory = kMemNJPerMiss * (double)std::max(0LL, llc);
@@ -239,7 +274,7 @@ double papi_mem_bound_fraction(const long long vals[kNumPapiEvents]) {
 
 	}
 
-	const double stall_cycles = (double)std::max(0LL, vals[2]) * MAL_PAPI_MISS_PENALTY_CYCLES * MAL_PAPI_MEM_BOUND_OOO_CORRECTION;
+	const double stall_cycles = (double)std::max(0LL, vals[2]) * g_papi_miss_penalty_cycles * g_papi_mem_bound_ooo_correction;
 
 	return std::min(1.0, stall_cycles / (double)vals[0]);
 

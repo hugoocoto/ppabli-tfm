@@ -41,6 +41,10 @@ class Resizer {
 	std::vector<long> target_cuts_;
 	long total_rem_{0};
 
+	// gathered: pool buffer with received slice. Owned by VecTask until either
+	// (a) consumed in apply_active() (memcpy then released by ~Resizer), or
+	// (b) moved to PendingActivation::vec_slices in waiting_for_activation path
+	// (then released by ~PendingActivation). After move, t.gathered = {} prevents double-free.
 	struct VecTask {
 		MalVec* v{nullptr};
 		StagedBuffer gathered;
@@ -158,6 +162,8 @@ struct ResizeCandidateEval {
 	double net_gain{0.0};
 	double rel_gain{0.0};
 	double score{0.0};
+	double predicted_cost{0.0};
+	double cost_rel_gain{0.0};
 	bool worthwhile{false};
 
 };
@@ -198,7 +204,7 @@ void log_top_resize_candidates(const std::vector<ResizeCandidateEval>& all_candi
 		const auto& c = all_candidates[(size_t)top_idx[t]];
 		const char* mode = (c.target_n == current_n) ? "rebalance" : ((c.target_n > current_n) ? "scale-up" : "scale-down");
 
-		MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Top candidate #%d: target=%d mode=%s score=%.4f rel=%.2f%% gain=%.4fs cost=%.4fs", t + 1, c.target_n, mode, c.score, c.rel_gain * 100.0, c.net_gain, c.transfer_cost);
+		MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Top candidate #%d: target=%d mode=%s score=%.4f rel=%.2f%% gain=%.4fs cost=%.4fs C(p)=%.4fps cost_rel=%.2f%%", t + 1, c.target_n, mode, c.score, c.rel_gain * 100.0, c.net_gain, c.transfer_cost, c.predicted_cost, c.cost_rel_gain * 100.0);
 
 	}
 
@@ -295,6 +301,8 @@ AutoResizeMetrics gather_auto_resize_metrics() {
 	m.mem_bound_fresh = (m.sum_thr_w > kEpsWeight) ? std::clamp(m.sum_mem_bound_w / m.sum_thr_w, 0.0, 1.0) : std::clamp(g.lb.global_mem_bound, 0.0, 1.0);
 
 	if (m.active_n > 0) {
+
+		std::lock_guard<std::mutex> lk(g.lb.weights_mu);
 
 		if ((int)g.lb.weights.size() < g.comm.u_size) {
 
@@ -483,7 +491,7 @@ void Resizer::collect_ranges() {
 
 	if (total_rem_ == 0) {
 
-		g.sync.stop = true;
+		g.sync.stop.store(true, std::memory_order_release);
 
 	}
 
@@ -508,6 +516,7 @@ void Resizer::collect_ranges() {
 
 	if (total_tp > 0.0) {
 
+		std::lock_guard<std::mutex> lk_w(g.lb.weights_mu);
 		const double thr_ewma_alpha_cr = std::clamp(g.cfg.auto_thr_ewma_alpha, kEpsElapsed, 1.0);
 
 		if (g.lb.auto_thr_ewma <= kEpsWeight) {
@@ -841,7 +850,25 @@ ResizeCandidateEval evaluate_resize_candidate(const AutoResizeMetrics& m, int cu
 	eval.net_gain = T_current - (eval.T_next + eval.transfer_cost);
 	eval.rel_gain = (T_current > kEpsThroughput) ? (eval.net_gain / T_current) : 0.0;
 	eval.score = phase_factor * (utility_throughput * throughput_gain + utility_energy * energy_gain - utility_migration * transfer_norm);
-	eval.worthwhile = eval.score > 0.0 && eval.net_gain > 0.0;
+
+	// Cost model C(p) = p * T_par(p). Add transfer_cost into prediction so policy
+	// pays the migration overhead like real wall time would.
+	const double current_cost = std::max(kEpsThroughput, (double)current_n * T_current);
+	eval.predicted_cost = (double)target_n * (eval.T_next + eval.transfer_cost);
+	eval.cost_rel_gain = (current_cost - eval.predicted_cost) / current_cost;
+
+	if (g.cfg.resize_policy == MAL_RESIZE_POLICY_COST) {
+
+		// Replace utility-based score with cost reduction ratio. Cap migration penalty
+		// implicitly because predicted_cost already includes transfer_cost.
+		eval.score = phase_factor * eval.cost_rel_gain;
+		eval.worthwhile = eval.cost_rel_gain > 0.0 && eval.net_gain > -transfer_cost;
+
+	} else {
+
+		eval.worthwhile = eval.score > 0.0 && eval.net_gain > 0.0;
+
+	}
 
 	return eval;
 
@@ -1885,7 +1912,7 @@ void Resizer::apply_inactive() {
 
 	}
 
-	g.sync.compute_ready = true;
+	g.sync.compute_ready.store(true, std::memory_order_release);
 
 }
 
@@ -2373,6 +2400,7 @@ ResizeDecision run_local_resize_decision(ResizeDecisionContext& ctx) {
 		case MAL_RESIZE_POLICY_AUTO:
 		case MAL_RESIZE_POLICY_THROUGHPUT:
 		case MAL_RESIZE_POLICY_ENERGY:
+		case MAL_RESIZE_POLICY_COST:
 			decision = decide_resize_auto(ctx);
 			break;
 
@@ -2423,9 +2451,13 @@ ResizeConsensus unanimous_resize_decision() {
 
 	ResizeConsensus out;
 	ResizeDecisionContext local_ctx = make_resize_decision_context();
-	ResizeDecision local_decision = run_local_resize_decision(local_ctx);
+	const bool is_active = (g.comm.active != MPI_COMM_NULL);
+	ResizeDecision local_decision = is_active ? run_local_resize_decision(local_ctx) : ResizeDecision{};
 	out.local_decision = local_decision;
-	out.local_decision_epoch = local_ctx.compute_epoch;
+
+	const unsigned long long post_decision_epoch = g.sync.compute_epoch.load(std::memory_order_acquire);
+	out.local_decision_epoch = std::max(local_ctx.compute_epoch, post_decision_epoch);
+	local_ctx.compute_epoch = out.local_decision_epoch;
 
 	if (g.comm.u_rank == 0) {
 
@@ -2433,22 +2465,29 @@ ResizeConsensus unanimous_resize_decision() {
 
 	}
 
+	const long long any_active_flag = is_active ? 1LL : 0LL;
 	const long long local_should = local_decision.should_resize ? 1LL : 0LL;
 	const long long local_target = local_decision.should_resize ? (long long)local_decision.target_active_size : -1LL;
 	const long long local_active = (long long)local_ctx.active_size;
 	const long long local_epoch = (long long)local_ctx.compute_epoch;
 
-	long long reduce_in[6] = { local_should, local_target, -local_should, -local_target, local_active, local_epoch};
-	long long reduce_out[6] = {0, 0, 0, 0, 0, 0};
+	const long long send_should = is_active ? local_should : 0LL;
+	const long long send_neg_should = is_active ? -local_should : LLONG_MIN / 2;
+	const long long send_target = is_active ? local_target : -1LL;
+	const long long send_neg_target = is_active ? -local_target : LLONG_MIN / 2;
 
-	MPI_Allreduce(reduce_in, reduce_out, 6, MPI_LONG_LONG, MPI_MAX, g.comm.universe);
+	long long reduce_in[7] = { send_should, send_target, send_neg_should, send_neg_target, local_active, local_epoch, any_active_flag};
+	long long reduce_out[7] = {0, 0, 0, 0, 0, 0, 0};
+
+	MPI_Allreduce(reduce_in, reduce_out, 7, MPI_LONG_LONG, MPI_MAX, g.comm.universe);
 
 	const long long max_should = reduce_out[0];
 	const long long max_target = reduce_out[1];
 	const long long min_should = -reduce_out[2];
 	const long long min_target = -reduce_out[3];
+	const bool any_active_voted = (reduce_out[6] != 0);
 
-	out.unanimous = (min_should == max_should) && (min_should == 0 || min_target == max_target);
+	out.unanimous = any_active_voted && (min_should == max_should) && (min_should == 0 || min_target == max_target);
 	out.should_resize = out.unanimous && min_should != 0;
 	out.target = out.should_resize ? (int)min_target : -1;
 	out.active_size = (int)reduce_out[4];

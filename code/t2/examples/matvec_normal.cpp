@@ -16,6 +16,8 @@ int main(int argc, char* argv[]) {
 
 	const long M = parse_arg_long(argc, argv, "m", 1000);
 	const long K = parse_arg_long(argc, argv, "k", 1000);
+	const long inner_reps_arg = parse_arg_long(argc, argv, "inner", 1000);
+	const long inner_reps = (inner_reps_arg > 0) ? inner_reps_arg : 1;
 
 	if (M % world_size != 0) {
 
@@ -72,17 +74,15 @@ int main(int argc, char* argv[]) {
 
 		float acc = 0.0f;
 
-		for (int iter = 0; iter < 1000; iter++) {
+		for (long iter = 0; iter < inner_reps; iter++) {
 
-			float row_acc = 0.0f;
+			acc = 0.0f;
 
 			for (long k = 0; k < K; k++) {
 
-				row_acc += local_A[static_cast<size_t>(r * K + k)] * x[static_cast<size_t>(k)];
+				acc += local_A[static_cast<size_t>(r * K + k)] * x[static_cast<size_t>(k)];
 
 			}
-
-			acc += row_acc;
 
 		}
 
@@ -112,7 +112,7 @@ int main(int argc, char* argv[]) {
 
 			for (long r = 0; r < M; r++) {
 
-				const float expected = static_cast<float>(r + 1) * static_cast<float>(K) * 1000.0f;
+				const float expected = static_cast<float>(r + 1) * static_cast<float>(K);
 
 				if (std::fabs(full_y[static_cast<size_t>(r)] - expected) > 1e-3f) {
 

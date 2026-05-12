@@ -15,9 +15,9 @@ int main(int argc, char* argv[]) {
 	MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 	MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
-	const long mal_n = parse_arg_long(argc, argv, "n", 20);
+	const long mal_n = parse_arg_long(argc, argv, "n", 200);
 	const long collapse_rows = parse_arg_long(argc, argv, "rows", 4);
-	const long collapse_cols = parse_arg_long(argc, argv, "cols", 5);
+	const long collapse_cols = parse_arg_long(argc, argv, "cols", 50);
 	const bool use_collapse = (argc > 1 && std::strcmp(argv[1], "collapse") == 0);
 	const long total_n = use_collapse ? (collapse_rows * collapse_cols) : mal_n;
 

@@ -5,6 +5,7 @@
 #include <mpi.h>
 #include "malleable.hpp"
 #include "example_utils.hpp"
+#include <cstring>
 
 int main(int argc, char* argv[]) {
 
@@ -60,8 +61,18 @@ int main(int argc, char* argv[]) {
 
 	#if !BENCH_CSV
 
-		float *A_ref = A;
-		float *B_ref = B;
+		float *A_ref = nullptr;
+		float *B_ref = nullptr;
+
+		if (mal_rank() == 0) {
+
+			A_ref = static_cast<float*>(std::malloc(static_cast<size_t>(M * K) * sizeof(float)));
+			B_ref = static_cast<float*>(std::malloc(static_cast<size_t>(K * N) * sizeof(float)));
+
+			std::memcpy(A_ref, A, static_cast<size_t>(M * K) * sizeof(float));
+			std::memcpy(B_ref, B, static_cast<size_t>(K * N) * sizeof(float));
+
+		}
 
 	#endif
 
@@ -75,9 +86,9 @@ int main(int argc, char* argv[]) {
 
 	#endif
 
-	mal_attach_mat(f, (void**)&A, sizeof(float), M, K, -1, MAL_ATTACH_PARTITIONED);
-	mal_attach_mat(f, (void**)&B, sizeof(float), K, N, -1, MAL_ATTACH_SHARED_ACTIVE);
-	mal_attach_mat(f, (void**)&C, sizeof(float), M, N, 0, MAL_ATTACH_PARTITIONED);
+	mal_attach_mat(f, (void**)&A, sizeof(float), M, K, -1);
+	mal_attach_mat(f, (void**)&B, sizeof(float), K, N, -1, MAL_ATTACH_SHARED_ACTIVE, MAL_ATTACH_INHERIT, MAL_ACCESS_READ_ONLY);
+	mal_attach_mat(f, (void**)&C, sizeof(float), M, N, 0);
 
 	for (; row < limit; row++) {
 
@@ -162,9 +173,39 @@ int main(int argc, char* argv[]) {
 
 	}
 
-	if (A) { std::free(A); }
-	if (B) { std::free(B); }
-	if (C) { std::free(C); }
+	#if !BENCH_CSV
+
+		if (A_ref) {
+
+			std::free(A_ref);
+
+		}
+
+		if (B_ref) {
+
+			std::free(B_ref);
+
+		}
+
+	#endif
+
+	if (A) {
+
+		std::free(A);
+
+	}
+
+	if (B) {
+
+		std::free(B);
+
+	}
+
+	if (C) {
+
+		std::free(C);
+
+	}
 
 	return EXIT_SUCCESS;
 

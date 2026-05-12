@@ -325,6 +325,47 @@ void load_env_config() {
 
 	}
 
+	if (const char* v = std::getenv("MAL_RESIZE_POLICY")) {
+
+		MalResizePolicy policy = g.cfg.resize_policy;
+		bool ok = true;
+
+		if (std::strcmp(v, "auto") == 0 || std::strcmp(v, "AUTO") == 0) {
+
+			policy = MAL_RESIZE_POLICY_AUTO;
+
+		} else if (std::strcmp(v, "throughput") == 0 || std::strcmp(v, "THROUGHPUT") == 0) {
+
+			policy = MAL_RESIZE_POLICY_THROUGHPUT;
+
+		} else if (std::strcmp(v, "energy") == 0 || std::strcmp(v, "ENERGY") == 0) {
+
+			policy = MAL_RESIZE_POLICY_ENERGY;
+
+		} else if (std::strcmp(v, "fixed") == 0 || std::strcmp(v, "FIXED") == 0 || std::strcmp(v, "fixed_sequence") == 0 || std::strcmp(v, "FIXED_SEQUENCE") == 0) {
+
+			policy = MAL_RESIZE_POLICY_FIXED_SEQUENCE;
+
+		} else if (std::strcmp(v, "cost") == 0 || std::strcmp(v, "COST") == 0) {
+
+			policy = MAL_RESIZE_POLICY_COST;
+
+		} else {
+
+			ok = false;
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_RESIZE_POLICY='%s' (valid: auto/throughput/energy/fixed/cost)", v);
+
+		}
+
+		if (ok) {
+
+			g.cfg.resize_policy = policy;
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_RESIZE_POLICY=%s", v);
+
+		}
+
+	}
+
 	if (g.cfg.resize_policy == MAL_RESIZE_POLICY_FIXED_SEQUENCE) {
 
 		load_resize_sequence_or_abort();
@@ -553,7 +594,13 @@ void mal_init(MalResizePolicy policy) {
 	}
 
 	rc = MPI_Comm_set_errhandler(g.comm.universe, MPI_ERRORS_RETURN);
-	log_mpi_error("MPI_Comm_set_errhandler(universe)", rc);
+
+	if (rc != MPI_SUCCESS) {
+
+		log_mpi_error("MPI_Comm_set_errhandler(universe)", rc);
+		std::abort();
+
+	}
 
 	rc = MPI_Comm_rank(g.comm.universe, &g.comm.u_rank);
 	log_mpi_error("MPI_Comm_rank(universe)", rc);
@@ -621,13 +668,23 @@ void vec_scatter(MalVec& v, const void* root_data) {
 
 	if (g.comm.a_rank == 0) {
 
+		const auto cuts = build_partition_cuts(v.total_N, g.comm.a_size);
 		sc.resize(g.comm.a_size);
 
 		for (int k = 0; k < g.comm.a_size; k++) {
 
-			long ks, ke;
-			distribute(v.total_N, g.comm.a_size, k, ks, ke);
-			sc[k] = (int)((ke - ks) * (long)v.elem_size);
+			long ks = cuts[(size_t)k];
+			long ke = cuts[(size_t)k + 1];
+			long bytes = (ke - ks) * (long)v.elem_size;
+
+			if (MAL_UNLIKELY(bytes > INT_MAX)) {
+
+				MAL_LOG_L(MAL_LOG_ERROR, "SCATTER", "Per-rank send size overflow (%ld bytes) for rank=%d in vec_scatter", bytes, k);
+				MPI_Abort(g.comm.universe, 1);
+
+			}
+
+			sc[k] = (int)bytes;
 
 		}
 
@@ -751,6 +808,8 @@ void vec_gather(MalVec& v) {
 
 	MPI_Gather(&my_send_bytes, 1, MPI_INT, root ? all_send_bytes.data() : nullptr, 1, MPI_INT, v.gather_root, g.comm.universe);
 
+	static thread_local void* tl_recv_raw = nullptr;
+	static thread_local size_t tl_recv_cap = 0;
 	void* recv_raw = nullptr;
 	size_t recv_cap = 0;
 
@@ -774,7 +833,9 @@ void vec_gather(MalVec& v) {
 		data_displs = make_displs(data_counts);
 
 		size_t total_recv = (size_t)(data_displs.back() + data_counts.back());
-		pool_reserve(recv_raw, recv_cap, total_recv > 0 ? total_recv : 1, /*preserve_data=*/false);
+		pool_reserve(tl_recv_raw, tl_recv_cap, total_recv > 0 ? total_recv : 1, /*preserve_data=*/false);
+		recv_raw = tl_recv_raw;
+		recv_cap = tl_recv_cap;
 
 	}
 
@@ -830,7 +891,8 @@ void vec_gather(MalVec& v) {
 
 	if (recv_raw) {
 
-		g_buffer_pool.release(recv_raw, recv_cap);
+		tl_recv_raw = recv_raw;
+		tl_recv_cap = recv_cap;
 
 	}
 
@@ -891,15 +953,22 @@ void mal_finalize() {
 	g.vecs.clear();
 
 	int naccs = (int)g.accs.size();
+	int local_naccs = naccs;
 
 	rc = MPI_Bcast(&naccs, 1, MPI_INT, 0, g.comm.universe);
 	log_mpi_error("MPI_Bcast(naccs, finalize)", rc);
+
+	if (MAL_UNLIKELY(naccs != local_naccs)) {
+
+		MAL_LOG_L(MAL_LOG_WARN, "FINALIZE", "Acc count mismatch (local=%d root=%d); reducing identity for missing entries", local_naccs, naccs);
+
+	}
 
 	struct FinalAccGetter {
 
 		MalAcc* operator()(int k) const {
 
-			return g.accs[(size_t)k].get();
+			return (k >= 0 && (size_t)k < g.accs.size()) ? g.accs[(size_t)k].get() : nullptr;
 
 		}
 
@@ -909,9 +978,15 @@ void mal_finalize() {
 
 		void operator()(int k, const char* r, int) const {
 
+			if (k < 0 || (size_t)k >= g.accs.size()) {
+
+				return;
+
+			}
+
 			MalAcc* a = g.accs[(size_t)k].get();
 
-			if (!a->ptr) {
+			if (!a || !a->ptr) {
 
 				return;
 
@@ -1042,7 +1117,13 @@ MalFor mal_for(long total_iters, long& iter, long& limit) {
 	set_iter(f, f.start);
 	limit = f.end;
 
-	g.sync.compute_ready = false;
+	{
+
+		std::lock_guard lk(g.sync.mu);
+		g.sync.compute_ready.store(false, std::memory_order_release);
+
+	}
+
 	g.loop = &f;
 
 	const bool skip_idle_activation_wait = (f.start == f.end) && !g.sync.pending_has_ranges.load(std::memory_order_acquire) && (total_iters <= g.comm.a_size);
@@ -1093,7 +1174,7 @@ void advance_next_range(MalFor& f) {
 
 void mal_check_for(MalFor& f) {
 
-	g.sync.compute_epoch.fetch_add(1, std::memory_order_release);
+	g.sync.compute_epoch.fetch_add(1, std::memory_order_relaxed);
 
 	if (g.sync.attach_pending.load(std::memory_order_acquire)) {
 
@@ -1187,9 +1268,21 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 
 	}
 
+	long buf_global_start = f.start;
+
+	if (policy == MAL_ATTACH_PARTITIONED && g.comm.a_size > 0 && g.comm.a_rank >= 0) {
+
+		const auto cuts = build_partition_cuts(total_N, g.comm.a_size);
+		const long ds = cuts[(size_t)g.comm.a_rank];
+		const long de = cuts[(size_t)g.comm.a_rank + 1];
+		n = de - ds;
+		buf_global_start = ds;
+
+	}
+
 	v->elem_size = elem_size;
 	v->local_n = n;
-	v->buf_global_start = f.start;
+	v->buf_global_start = buf_global_start;
 	v->total_N = total_N;
 	v->user_ptr = user_ptr;
 	v->gather_root = result_rank;
@@ -1264,7 +1357,17 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 
 	}
 
-	v->sync_user_ptr();
+	const bool inactive_no_pending = (g.comm.active == MPI_COMM_NULL && !g.pending && policy == MAL_ATTACH_PARTITIONED);
+
+	if (inactive_no_pending && user_ptr) {
+
+		*user_ptr = nullptr;
+
+	} else {
+
+		v->sync_user_ptr();
+
+	}
 
 	f.vecs.push_back(v);
 	g.vecs.push_back(std::move(vp));
@@ -1353,7 +1456,23 @@ void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n
 
 	}
 
-	const size_t total_bytes = (size_t)primary_n * (size_t)secondary_n * elem_size;
+	if (MAL_UNLIKELY(elem_size > 0 && secondary_n > 0 && (size_t)secondary_n > SIZE_MAX / elem_size)) {
+
+		MAL_LOG_L(MAL_LOG_ERROR, "ATTACH", "mal_attach_mat row stride overflow secondary_n=%ld elem_size=%zu", secondary_n, elem_size);
+		MPI_Abort(g.comm.universe, 1);
+
+	}
+
+	const size_t row_bytes = (size_t)secondary_n * elem_size;
+
+	if (MAL_UNLIKELY(row_bytes > 0 && primary_n > 0 && (size_t)primary_n > SIZE_MAX / row_bytes)) {
+
+		MAL_LOG_L(MAL_LOG_ERROR, "ATTACH", "mal_attach_mat total bytes overflow primary_n=%ld secondary_n=%ld elem_size=%zu", primary_n, secondary_n, elem_size);
+		MPI_Abort(g.comm.universe, 1);
+
+	}
+
+	const size_t total_bytes = (size_t)primary_n * row_bytes;
 	const bool shared_all = (policy == MAL_ATTACH_SHARED_ALL);
 	const bool async_attach = use_async_attach_mode(exec_mode);
 

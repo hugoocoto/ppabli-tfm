@@ -14,9 +14,9 @@ int main(int argc, char* argv[]) {
 	MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 	MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
-	const long M = parse_arg_long(argc, argv, "m", 1000);
-	const long K = parse_arg_long(argc, argv, "k", 1000);
-	const long N = parse_arg_long(argc, argv, "n", 1000);
+	const long M = parse_arg_long(argc, argv, "m", 120);
+	const long K = parse_arg_long(argc, argv, "k", 60);
+	const long N = parse_arg_long(argc, argv, "n", 40);
 
 	if (M % world_size != 0) {
 
