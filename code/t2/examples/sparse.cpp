@@ -92,6 +92,8 @@ int main(int argc, char* argv[]) {
 
 	for (; row < limit; row++) {
 
+		std::memset(&C[row * N], 0, static_cast<size_t>(N) * sizeof(float));
+
 		for (long i = 0; i < K; i++) {
 
 			const float a_val = A[row * K + i];

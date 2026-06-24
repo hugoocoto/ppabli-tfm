@@ -2,7 +2,6 @@
 #define MALLEABLE_TYPES_CPP_INCLUDED
 
 #include "malleable.hpp"
-#include "malleable_papi.cpp"
 
 #include <algorithm>
 #include <atomic>
@@ -42,27 +41,11 @@
 
 #endif
 
-struct ResizeDecisionContext {
-
-	int universe_size{0};
-	int active_size{0};
-	unsigned long long compute_epoch{0};
-
-};
-
 struct ResizeDecision {
 
 	bool should_resize{false};
+	bool done{false};
 	int target_active_size{-1};
-	bool post_eval_valid{false};
-	int post_eval_from_n{0};
-	int post_eval_to_n{0};
-	double post_eval_decision_time{0.0};
-	double post_eval_pred_net_gain{0.0};
-	double post_eval_pred_rel_gain{0.0};
-	double post_eval_pred_score{0.0};
-	double post_eval_baseline_thr{0.0};
-	double post_eval_baseline_remaining{0.0};
 
 };
 
@@ -365,8 +348,10 @@ struct PendingActivation {
 	std::vector<StagedBuffer> vec_slices;
 	std::vector<std::vector<char>> acc_epoch_bufs;
 	std::vector<StagedBuffer> shared_mats;
+	std::vector<StagedBuffer> shared_vecs;
 	size_t next_acc{0};
 	size_t next_shared{0};
+	size_t next_shared_vec{0};
 
 	~PendingActivation() {
 
@@ -377,6 +362,12 @@ struct PendingActivation {
 		}
 
 		for (const auto& buf : shared_mats) {
+
+			g_buffer_pool.release(buf.ptr, buf.bytes);
+
+		}
+
+		for (const auto& buf : shared_vecs) {
 
 			g_buffer_pool.release(buf.ptr, buf.bytes);
 
@@ -403,7 +394,6 @@ struct MalState {
 
 	struct Config {
 
-		// sequence: written only pre-mal_init via load_resize_sequence_or_abort; never resized after worker thread starts. seq_idx: single-writer (worker thread) post-init.
 		std::vector<int> sequence;
 		std::atomic<size_t> seq_idx{0};
 		MalResizePolicy resize_policy{MAL_RESIZE_POLICY_AUTO};
@@ -414,22 +404,14 @@ struct MalState {
 		std::atomic<bool> log_all_ranks{kDefaultLogAllRanks};
 		std::atomic<bool> malleability_enabled{kDefaultMalleabilityEnabled};
 		std::atomic<bool> load_balancing_enabled{kDefaultLoadBalancingEnabled};
+		std::atomic<bool> fast_response{false};
 		std::atomic<MalAttachExecMode> attach_mode{MAL_ATTACH_SYNC};
-
-		double auto_bandwidth_bps{1e9};
-		double auto_sync_overhead_frac{0.05};
-		double auto_thr_ewma_alpha{0.30};
-		double auto_calibration_alpha{0.20};
-		double auto_trust_guard_cap{2.0};
-		double auto_min_rel_gain_floor{0.02};
-		double auto_min_rel_gain_cap{0.30};
-		int auto_candidate_radius{1};
-		int auto_candidate_stride{4};
 
 		bool affinity_enabled{kDefaultAffinityEnabled};
 		int main_core{kDefaultMainCore};
 		int worker_core{kDefaultWorkerCore};
 		int resolved_main_core{-1};
+		int node_local_rank{0};
 		int initial_size{kDefaultInitialSize};
 
 	} cfg;
@@ -443,6 +425,7 @@ struct MalState {
 		alignas(64) std::atomic<bool> loop_has_new_work{false};
 		alignas(64) std::atomic<bool> pending_has_ranges{false};
 		alignas(64) std::atomic<unsigned long long> compute_epoch{0};
+		alignas(64) std::atomic<bool> finalize_requested{false};
 
 		alignas(64) std::mutex mu;
 		std::condition_variable cv;
@@ -450,9 +433,17 @@ struct MalState {
 		template<typename Pred>
 		void compute_wait(Pred ready) {
 
+			if (ready()) {
+
+				return;
+
+			}
+
 			{
+
 				std::lock_guard lk(mu);
 				compute_ready.store(true, std::memory_order_release);
+
 			}
 
 			cv.notify_one();
@@ -471,7 +462,7 @@ struct MalState {
 
 			std::unique_lock lk(mu);
 
-			while (!compute_ready.load(std::memory_order_acquire) && !stop.load(std::memory_order_acquire)) {
+			while (!compute_ready.load(std::memory_order_acquire) && !stop.load(std::memory_order_acquire) && !finalize_requested.load(std::memory_order_acquire)) {
 
 				cv.wait(lk);
 
@@ -480,6 +471,12 @@ struct MalState {
 		}
 
 		void notify() {
+
+			{
+
+				std::lock_guard lk(mu);
+
+			}
 
 			cv.notify_all();
 
@@ -490,17 +487,7 @@ struct MalState {
 	struct PreparedResize {
 
 		int target{-1};
-		unsigned long long decision_epoch{0};
 		unsigned long long local_decision_epoch{0};
-		bool post_eval_valid{false};
-		int post_eval_from_n{0};
-		int post_eval_to_n{0};
-		double post_eval_decision_time{0.0};
-		double post_eval_pred_net_gain{0.0};
-		double post_eval_pred_rel_gain{0.0};
-		double post_eval_pred_score{0.0};
-		double post_eval_baseline_thr{0.0};
-		double post_eval_baseline_remaining{0.0};
 		std::unique_ptr<Resizer> work;
 
 		bool ready() const noexcept {
@@ -512,56 +499,38 @@ struct MalState {
 		void reset() noexcept {
 
 			target = -1;
-			decision_epoch = 0;
 			local_decision_epoch = 0;
-			post_eval_valid = false;
-			post_eval_from_n = 0;
-			post_eval_to_n = 0;
-			post_eval_decision_time = 0.0;
-			post_eval_pred_net_gain = 0.0;
-			post_eval_pred_rel_gain = 0.0;
-			post_eval_pred_score = 0.0;
-			post_eval_baseline_thr = 0.0;
-			post_eval_baseline_remaining = 0.0;
 			work.reset();
 
 		}
 
 	};
 
-	struct LoadBalance {
+	struct alignas(64) LoadBalance {
 
 		std::vector<double> weights;
 		mutable std::mutex weights_mu;
 		double epoch_start_time{0.0};
 		long epoch_assigned{0};
-		double alpha{0.3};
-		double auto_thr_ewma{0.0};
-		double auto_bw_est_bps{0.0};
-		double auto_alpha_est_sec{0.0};
-		double sync_wait_est_sec{0.0};
+		double thr_single_proc{0.0};
 
 		int resize_cooldown{0};
 		int same_size_rebalance_cooldown{0};
+		int prev_resize_from{0};
+		int prev_resize_to{0};
 
-		long long papi_prev_vals[kNumPapiEvents]{};
+		enum class Phase : int8_t {
+			IDLE = 0,
+			NEEDS_BASELINE,
+			EXPLORE_MAX,
+			SEARCHING,
+			PROBING
+		};
 
-		double global_mem_bound{0.0};
-		double global_ipc_ewma{0.0};
-		double ipc_peak_ref{0.0};
-		double ipc_drop_ewma{0.0};
-		double benefit_trust{1.0};
-		double migration_aversion{1.0};
-
-		bool post_eval_pending{false};
-		int post_eval_from_n{0};
-		int post_eval_to_n{0};
-		double post_eval_decision_time{0.0};
-		double post_eval_pred_net_gain{0.0};
-		double post_eval_pred_rel_gain{0.0};
-		double post_eval_pred_score{0.0};
-		double post_eval_baseline_thr{0.0};
-		double post_eval_baseline_remaining{0.0};
+		Phase bs_phase{Phase::IDLE};
+		int bs_lo{1};
+		int bs_hi{-1};
+		int bs_baseline_count{0};
 
 	} lb;
 
@@ -583,6 +552,30 @@ struct MalState {
 
 	std::thread worker;
 
+	struct Timing {
+
+		bool enabled{false};
+		double t_origin{0.0};
+		double init{0.0};
+		double mal_for_total{0.0};
+		double attach_total{0.0};
+		double check_wait_resize{0.0};
+		double check_wait_attach{0.0};
+		double check_wait_total{0.0};
+		double check_for_total{0.0};
+		double finalize_worker_join{0.0};
+		double finalize_vec_gather{0.0};
+		double finalize_acc_reduce{0.0};
+		double finalize_cleanup{0.0};
+		double resize_prepare{0.0};
+		double resize_commit{0.0};
+		double epoch_decision{0.0};
+		int resize_count{0};
+		int epoch_decision_count{0};
+		double wait_for_compute{0.0};
+
+	} timing;
+
 	MalState() noexcept = default;
 	MalState(const MalState&) = delete;
 	MalState& operator=(const MalState&) = delete;
@@ -603,9 +596,10 @@ MalFor::~MalFor() {
 
 }
 
-MalFor::MalFor(MalFor&& other) noexcept : start(other.start), end(other.end), current(other.current), user_iter(other.user_iter), user_limit(other.user_limit), plan_idx(other.plan_idx), plan_ranges(std::move(other.plan_ranges)), plan_local_bases(std::move(other.plan_local_bases)), vecs(std::move(other.vecs)), accs(std::move(other.accs)) {
+MalFor::MalFor(MalFor&& other) noexcept : start(other.start), end(other.end), current(other.current), user_iter(other.user_iter), user_limit(other.user_limit), plan_idx(other.plan_idx), check_counter(other.check_counter), plan_ranges(std::move(other.plan_ranges)), plan_local_bases(std::move(other.plan_local_bases)), vecs(std::move(other.vecs)), accs(std::move(other.accs)) {
 
 	phase.store(other.phase.load(std::memory_order_relaxed), std::memory_order_relaxed);
+	confirmed_iter.store(other.confirmed_iter.load(std::memory_order_relaxed), std::memory_order_relaxed);
 
 	if (g.loop == &other) {
 
@@ -619,7 +613,40 @@ MalFor::MalFor(MalFor&& other) noexcept : start(other.start), end(other.end), cu
 	other.start = 0;
 	other.end = 0;
 	other.plan_idx = 0;
+	other.check_counter = 0;
 	other.phase.store(MAL_LOOP_FINISHED, std::memory_order_release);
+
+}
+
+static int detect_node_local_rank(int fallback_rank) {
+
+	static const char* const kLocalRankVars[] = {
+		"OMPI_COMM_WORLD_LOCAL_RANK",
+		"SLURM_LOCALID",
+		"MPI_LOCALRANKID",
+		"MV2_COMM_WORLD_LOCAL_RANK",
+		"PMIX_LOCAL_RANK",
+		"PMI_LOCAL_RANK",
+	};
+
+	for (const char* var : kLocalRankVars) {
+
+		if (const char* v = std::getenv(var)) {
+
+			char* end = nullptr;
+			long r = std::strtol(v, &end, 10);
+
+			if (end != v && r >= 0) {
+
+				return (int)r;
+
+			}
+
+		}
+
+	}
+
+	return std::max(0, fallback_rank);
 
 }
 
@@ -702,6 +729,31 @@ MalFor::MalFor(MalFor&& other) noexcept : start(other.start), end(other.end), cu
 
 	}
 
+	static const cpu_set_t& linux_allowed_mask() {
+
+		static const cpu_set_t mask = [] {
+
+			cpu_set_t m;
+			CPU_ZERO(&m);
+
+			if (sched_getaffinity(0, sizeof(m), &m) != 0) {
+
+				for (int i = 0; i < CPU_SETSIZE; i++) {
+
+					CPU_SET(i, &m);
+
+				}
+
+			}
+
+			return m;
+
+		}();
+
+		return mask;
+
+	}
+
 	static void linux_split_cores(std::vector<int>& pcores, std::vector<int>& ecores) {
 
 		auto cores = linux_get_metrics();
@@ -709,6 +761,26 @@ MalFor::MalFor(MalFor&& other) noexcept : start(other.start), end(other.end), cu
 		if (cores.empty()) {
 
 			return;
+
+		}
+
+		const cpu_set_t& allowed = linux_allowed_mask();
+		std::vector<std::pair<int, unsigned long>> usable;
+		usable.reserve(cores.size());
+
+		for (auto& [id, v] : cores) {
+
+			if (id >= 0 && id < CPU_SETSIZE && CPU_ISSET(id, &allowed)) {
+
+				usable.emplace_back(id, v);
+
+			}
+
+		}
+
+		if (!usable.empty()) {
+
+			cores.swap(usable);
 
 		}
 
@@ -751,9 +823,6 @@ MalFor::MalFor(MalFor&& other) noexcept : start(other.start), end(other.end), cu
 
 	static std::optional<int> linux_pick_core(bool want_pcore, int exclude = -1) {
 
-		static std::atomic<size_t> p_idx{0};
-		static std::atomic<size_t> e_idx{0};
-
 		std::vector<int> pcores, ecores;
 		linux_split_cores(pcores, ecores);
 
@@ -765,11 +834,13 @@ MalFor::MalFor(MalFor&& other) noexcept : start(other.start), end(other.end), cu
 
 		}
 
-		auto& idx = want_pcore ? p_idx : e_idx;
+		std::sort(pool.begin(), pool.end());
+
+		const size_t base = (size_t)std::max(0, g.cfg.node_local_rank);
 
 		for (size_t i = 0; i < pool.size(); i++) {
 
-			int core = pool[(idx++) % pool.size()];
+			int core = pool[(base + i) % pool.size()];
 
 			if (core != exclude) {
 
@@ -824,6 +895,14 @@ MalFor::MalFor(MalFor&& other) noexcept : start(other.start), end(other.end), cu
 			}
 
 		} else {
+
+			if (core_id >= CPU_SETSIZE || !CPU_ISSET(core_id, &linux_allowed_mask())) {
+
+				MAL_LOG_L(MAL_LOG_WARN, "AFFINITY", "%s: configured core %d is outside the allowed cpuset (resource manager / launcher binding), not pinning", label, core_id);
+
+				return;
+
+			}
 
 			MAL_LOG_L(MAL_LOG_DEBUG, "AFFINITY", "%s: using configured core %d", label, core_id);
 
@@ -941,12 +1020,15 @@ int mal_size() {
 
 }
 
-double mal_log_time_s() {
+int mal_active_size() {
 
-	static const auto t0 = std::chrono::steady_clock::now();
-	const auto now = std::chrono::steady_clock::now();
+	return g.comm.a_size;
 
-	return std::chrono::duration<double>(now - t0).count();
+}
+
+double mal_t_origin() {
+
+	return g.timing.t_origin;
 
 }
 
@@ -983,32 +1065,6 @@ const char* mal_log_level_name(MalLogLevel level) {
 
 }
 
-const char* mal_log_level_color(MalLogLevel level) {
-
-	if (!isatty(STDOUT_FILENO)) {
-
-		return "";
-
-	}
-
-	switch (level) {
-
-		case MAL_LOG_DEBUG: return "\x1b[36m";
-		case MAL_LOG_INFO: return "\x1b[32m";
-		case MAL_LOG_WARN: return "\x1b[33m";
-		case MAL_LOG_ERROR: return "\x1b[31m";
-
-	}
-
-	return "";
-
-}
-
-const char* mal_log_reset_color() {
-
-	return isatty(STDOUT_FILENO) ? "\x1b[0m" : "";
-
-}
 
 const MPI_Datatype kDtypeTbl[] = {MPI_INT, MPI_LONG, MPI_LONG_LONG, MPI_UNSIGNED, MPI_UNSIGNED_LONG, MPI_FLOAT, MPI_DOUBLE};
 
@@ -1123,6 +1179,39 @@ void write_identity(char* dst, int dtype_tag, int dop_tag, int esz) {
 
 }
 
+template<typename T>
+inline void combine_with_op_t(void* dst, const void* src, int dop) {
+
+	T& d = *static_cast<T*>(dst);
+	const T& s = *static_cast<const T*>(src);
+
+	switch (dop) {
+
+		case kDopSUM: d += s; break;
+		case kDopPROD: d *= s; break;
+		case kDopMAX: if (s > d) d = s; break;
+		case kDopMIN: if (s < d) d = s; break;
+
+	}
+
+}
+
+void combine_with_op(void* dst, const void* src, int dtype_tag, int dop_tag) {
+
+	switch (dtype_tag) {
+
+		case kDtypeINT: combine_with_op_t<int>(dst, src, dop_tag); break;
+		case kDtypeLONG: combine_with_op_t<long>(dst, src, dop_tag); break;
+		case kDtypeLLONG: combine_with_op_t<long long>(dst, src, dop_tag); break;
+		case kDtypeUINT: combine_with_op_t<unsigned>(dst, src, dop_tag); break;
+		case kDtypeULONG: combine_with_op_t<unsigned long>(dst, src, dop_tag); break;
+		case kDtypeFLOAT: combine_with_op_t<float>(dst, src, dop_tag); break;
+		case kDtypeDOUBLE: combine_with_op_t<double>(dst, src, dop_tag); break;
+
+	}
+
+}
+
 void* checked_realloc(void* p, size_t n, const char* ctx) {
 
 	void* nb = std::realloc(p, n);
@@ -1189,6 +1278,36 @@ void mpi_bcast_bytes(void* buf, size_t bytes, int root, MPI_Comm comm) {
 
 }
 
+void mpi_send_bytes(const void* buf, size_t bytes, int dest, int tag, MPI_Comm comm) {
+
+	const char* p = static_cast<const char*>(buf);
+	size_t off = 0;
+
+	while (off < bytes) {
+
+		int chunk = (int)std::min(bytes - off, (size_t)INT_MAX);
+		MPI_Send(p + off, chunk, MPI_BYTE, dest, tag, comm);
+		off += (size_t)chunk;
+
+	}
+
+}
+
+void mpi_recv_bytes(void* buf, size_t bytes, int src, int tag, MPI_Comm comm) {
+
+	char* p = static_cast<char*>(buf);
+	size_t off = 0;
+
+	while (off < bytes) {
+
+		int chunk = (int)std::min(bytes - off, (size_t)INT_MAX);
+		MPI_Recv(p + off, chunk, MPI_BYTE, src, tag, comm, MPI_STATUS_IGNORE);
+		off += (size_t)chunk;
+
+	}
+
+}
+
 inline bool use_async_attach_mode(MalAttachExecMode mode = MAL_ATTACH_INHERIT) {
 
 	MalAttachExecMode effective = mode;
@@ -1232,48 +1351,7 @@ void dispatch_attach_task(std::function<void()> fn, bool async) {
 
 	}
 
-	struct SyncAttachState {
-		std::mutex mu;
-		std::condition_variable cv;
-		bool done{false};
-	};
-
-	struct SyncAttachTask {
-
-		std::function<void()> fn;
-		std::shared_ptr<SyncAttachState> state;
-
-		void operator()() {
-
-			if (fn) {
-
-				fn();
-
-			}
-
-			{
-
-				std::lock_guard lk(state->mu);
-				state->done = true;
-
-			}
-
-			state->cv.notify_one();
-
-		}
-
-	};
-
-	auto state = std::make_shared<SyncAttachState>();
-	enqueue_attach_task(SyncAttachTask{std::move(fn), state});
-
-	std::unique_lock lk(state->mu);
-
-	while (!state->done && !g.sync.stop.load(std::memory_order_acquire)) {
-
-		state->cv.wait(lk);
-
-	}
+	fn();
 
 }
 
@@ -1316,8 +1394,18 @@ void run_attach_bcast_once_all(void* buf, size_t bytes, bool wait = true) {
 
 inline bool has_work_or_stop() {
 
-	if (g.sync.stop.load(std::memory_order_acquire)) return true;
-	if (g.sync.attach_pending.load(std::memory_order_acquire)) return true;
+	if (g.sync.stop.load(std::memory_order_acquire)) {
+
+		return true;
+
+	}
+
+	if (g.sync.attach_pending.load(std::memory_order_acquire)) {
+
+		return true;
+
+	}
+
 	if (g.sync.loop_has_new_work.load(std::memory_order_acquire)) {
 
 		g.sync.loop_has_new_work.store(false, std::memory_order_relaxed);
@@ -1533,7 +1621,7 @@ void refresh_inactive_read_only_cache(MalVec& v) {
 
 }
 
-void vec_scatter(MalVec& v, const void* root_data);
+void vec_scatter(MalVec& v, const void* root_data, const std::vector<long>& cuts);
 
 void advance_read_only_cache_after_progress(MalVec& v, long old_done, long new_done) {
 
@@ -1597,25 +1685,21 @@ void async_broadcast_bytes(MPI_Comm comm, void* buf, size_t total_bytes, bool wa
 
 void init_shared_buffer_from_root(void* buf, size_t total_bytes, bool is_root, const void* orig, const char* warn_msg) {
 
-	if (total_bytes == 0) {
+	if (total_bytes == 0 || !is_root) {
 
 		return;
 
 	}
 
-	if (is_root && !orig) {
+	if (!orig) {
 
 		MAL_LOG_L(MAL_LOG_WARN, "ATTACH", "%s", warn_msg);
+		std::memset(buf, 0, total_bytes);
+		return;
 
 	}
 
-	std::memset(buf, 0, total_bytes);
-
-	if (is_root && orig) {
-
-		std::memcpy(buf, orig, total_bytes);
-
-	}
+	std::memcpy(buf, orig, total_bytes);
 
 }
 
@@ -1649,6 +1733,7 @@ struct PartitionedAttachScatterTask {
 	void* orig{nullptr};
 	int result_rank{-1};
 	size_t orig_bytes{0};
+	std::vector<long> cuts;
 
 	void operator()() const {
 
@@ -1663,8 +1748,12 @@ struct PartitionedAttachScatterTask {
 
 		if (op) {
 
-			vec_scatter(*vec, orig);
+			vec_scatter(*vec, orig, cuts);
 			maybe_release_root_attach_buffer(orig, orig_bytes, g.comm.u_rank == 0 && result_rank < 0);
+
+		} else if (vec->buf && vec->local_n > 0) {
+
+			std::memset(vec->buf, 0, (size_t)vec->local_n * vec->elem_size);
 
 		}
 
@@ -1672,11 +1761,35 @@ struct PartitionedAttachScatterTask {
 
 };
 
-void run_partitioned_attach_scatter(MalVec& v, void* orig, int result_rank, size_t orig_bytes, MalAttachExecMode exec_mode) {
+void run_partitioned_attach_scatter(MalVec& v, void* orig, int result_rank, size_t orig_bytes, MalAttachExecMode exec_mode, std::vector<long> cuts) {
 
 	const int do_scatter = (orig && result_rank < 0) ? 1 : 0;
+
+	if (g.comm.a_size == 1) {
+
+		if (do_scatter && orig && v.buf) {
+
+			size_t copy_bytes = (size_t)std::max(0L, v.local_n) * v.elem_size;
+
+			if (copy_bytes > 0) {
+
+				std::memcpy(v.buf, orig, copy_bytes);
+
+			}
+
+		} else if (!do_scatter && v.buf && v.local_n > 0) {
+
+			std::memset(v.buf, 0, (size_t)v.local_n * v.elem_size);
+
+		}
+
+		maybe_release_root_attach_buffer(orig, orig_bytes, g.comm.u_rank == 0 && result_rank < 0);
+		return;
+
+	}
+
 	const bool wait = !use_async_attach_mode(exec_mode);
-	dispatch_attach_task(PartitionedAttachScatterTask{&v, do_scatter, orig, result_rank, orig_bytes}, !wait);
+	dispatch_attach_task(PartitionedAttachScatterTask{&v, do_scatter, orig, result_rank, orig_bytes, std::move(cuts)}, !wait);
 
 }
 
@@ -1692,6 +1805,7 @@ void run_shared_all_attach_bcast(void* buf, void* orig, size_t total_bytes, int 
 
 	init_shared_buffer_from_root(buf, total_bytes, g.comm.u_rank == 0, orig, warn_msg);
 	run_attach_bcast_once_all(buf, total_bytes, !use_async_attach_mode(exec_mode));
+
 	maybe_release_root_attach_buffer(orig, total_bytes, g.comm.u_rank == 0 && result_rank < 0);
 
 }
@@ -1704,11 +1818,19 @@ void* acquire_or_broadcast_active_shared_mat(void* orig, size_t total_bytes, Mal
 
 }
 
-std::vector<char> take_pending_acc_epoch_buf(size_t fallback_size) {
+std::vector<char> take_pending_acc_epoch_buf(size_t fallback_size, int dtype_tag, int dop_tag) {
 
 	if (!g.pending || g.pending->next_acc >= g.pending->acc_epoch_bufs.size()) {
 
-		return std::vector<char>(fallback_size, 0);
+		std::vector<char> buf(fallback_size, 0);
+
+		if (fallback_size > 0) {
+
+			write_identity(buf.data(), dtype_tag, dop_tag, (int)fallback_size);
+
+		}
+
+		return buf;
 
 	}
 
@@ -1731,6 +1853,23 @@ StagedBuffer take_pending_shared_mat() {
 
 }
 
+StagedBuffer take_pending_shared_vec() {
+
+	if (!g.pending || g.pending->next_shared_vec >= g.pending->shared_vecs.size()) {
+
+		return {};
+
+	}
+
+	StagedBuffer buf = g.pending->shared_vecs[g.pending->next_shared_vec];
+	g.pending->shared_vecs[g.pending->next_shared_vec] = {};
+	g.pending->next_shared_vec++;
+	return buf;
+
+}
+
+void sync_vec_mapping_for_current_range(MalFor& f);
+
 void load_pending_ranges_into_loop(MalFor& f) {
 
 	if (!g.pending || g.pending->ranges.empty()) {
@@ -1752,6 +1891,8 @@ void load_pending_ranges_into_loop(MalFor& f) {
 
 	}
 
+	f.confirmed_iter.store(f.start - 1, std::memory_order_release);
+
 	if (f.user_limit) {
 
 		*f.user_limit = f.end;
@@ -1760,24 +1901,7 @@ void load_pending_ranges_into_loop(MalFor& f) {
 
 	f.phase.store(MAL_LOOP_ATTACHING, std::memory_order_relaxed);
 
-	for (MalVec* v : f.vecs) {
-
-		if (!v || vec_is_fully_replicated(*v)) {
-
-			continue;
-
-		}
-
-		long new_global_start = f.start - (v->plan_origin_n + current_range_local_base(f));
-
-		if (v->buf_global_start != new_global_start) {
-
-			v->buf_global_start = new_global_start;
-			v->sync_user_ptr();
-
-		}
-
-	}
+	sync_vec_mapping_for_current_range(f);
 
 }
 
@@ -1839,9 +1963,9 @@ void batched_allreduce(int n, GetAcc get_acc, OnResult on_result) {
 
 				a->fn_get(a->ptr, slot);
 
-				if (g.comm.u_rank == 0) {
+				if (g.comm.u_rank == 0 && !a->epoch_buf.empty()) {
 
-					a->fn_add(slot, a->epoch_buf.data());
+					combine_with_op(slot, a->epoch_buf.data(), a->dtype_idx, a->dop_idx);
 
 				}
 
@@ -2033,13 +2157,77 @@ std::vector<long> build_partition_cuts(long total, int nprocs) {
 
 	}
 
-	double prefix = 0.0;
+	std::vector<long> sizes((size_t)nprocs, 0);
+	std::vector<double> rem((size_t)nprocs, 0.0);
+	long base_sum = 0;
 
 	for (int r = 0; r < nprocs; r++) {
 
-		cuts[(size_t)r] = std::clamp((long)std::llround((prefix / sum_w) * (double)total), 0L, total);
-		prefix += w[r];
-		cuts[(size_t)r + 1] = std::clamp((long)std::llround((prefix / sum_w) * (double)total), cuts[(size_t)r], total);
+		const double share = (w[r] / sum_w) * (double)total;
+		sizes[(size_t)r] = (long)std::floor(share);
+		rem[(size_t)r] = share - (double)sizes[(size_t)r];
+		base_sum += sizes[(size_t)r];
+
+	}
+
+	long leftover = total - base_sum;
+
+	if (leftover > 0) {
+
+		std::vector<int> idx((size_t)nprocs);
+		std::iota(idx.begin(), idx.end(), 0);
+		std::sort(idx.begin(), idx.end(), [&](int a, int b) { return rem[(size_t)a] > rem[(size_t)b]; });
+
+		for (long k = 0; k < leftover && k < (long)nprocs; k++) {
+
+			sizes[(size_t)idx[(size_t)k]]++;
+
+		}
+
+	}
+
+	if (total >= (long)nprocs) {
+
+		for (int r = 0; r < nprocs; r++) {
+
+			if (sizes[(size_t)r] != 0) {
+
+				continue;
+
+			}
+
+			int donor = -1;
+			long max_sz = 1;
+
+			for (int j = 0; j < nprocs; j++) {
+
+				if (sizes[(size_t)j] > max_sz) {
+
+					max_sz = sizes[(size_t)j];
+					donor = j;
+
+				}
+
+			}
+
+			if (donor < 0) {
+
+				break;
+
+			}
+
+			sizes[(size_t)donor]--;
+			sizes[(size_t)r]++;
+
+		}
+
+	}
+
+	cuts[0] = 0;
+
+	for (int r = 0; r < nprocs; r++) {
+
+		cuts[(size_t)r + 1] = cuts[(size_t)r] + sizes[(size_t)r];
 
 	}
 
@@ -2218,6 +2406,7 @@ MalForND mal_for_nd_begin(long* const* vars, const long* starts, const long* lim
 	if (!out.done && out.iter_vars.size() == ndims) {
 
 		mal_collapse_decode(out.spec, out.flat, out.decoded_idx.data());
+		out.last_flat = out.flat;
 
 		for (size_t d = 0; d < ndims; d++) {
 
@@ -2363,7 +2552,32 @@ void mal_check_for(MalForND& f) {
 
 	}
 
+	if (scheduled_flat == f.last_flat && !f.decoded_idx.empty() && f.decoded_idx.size() == f.spec.extents.size()) {
+
+		long& inner = f.decoded_idx.back();
+
+		if (inner + 1 < f.spec.extents.back()) {
+
+			inner++;
+			f.flat = next_flat;
+			f.last_flat = next_flat;
+
+			const size_t d = f.decoded_idx.size() - 1;
+
+			if (d < f.iter_vars.size() && d < f.starts.size() && f.iter_vars[d]) {
+
+				*f.iter_vars[d] = f.starts[d] + inner - 1;
+
+			}
+
+			return;
+
+		}
+
+	}
+
 	f.flat = next_flat;
+	f.last_flat = next_flat;
 	mal_for_nd_sync_limits(f);
 	mal_for_nd_set_iters_from_flat(f, next_flat, true);
 

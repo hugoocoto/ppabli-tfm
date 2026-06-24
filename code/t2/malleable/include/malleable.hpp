@@ -16,6 +16,8 @@
 
 int mal_rank();
 int mal_size();
+int mal_active_size();
+double mal_t_origin();
 
 enum MalLogLevel {
 	MAL_LOG_DEBUG,
@@ -25,14 +27,10 @@ enum MalLogLevel {
 };
 
 const char* mal_log_level_name(MalLogLevel level);
-const char* mal_log_level_color(MalLogLevel level);
-const char* mal_log_reset_color();
-
-double mal_log_time_s();
 bool mal_should_log(MalLogLevel level);
 
-#define MAL_LOG(level, fmt, ...) do { MalLogLevel _mal_level = (level); if (mal_should_log(_mal_level)) printf("%s[%8.3f][%-6s][R%d] | " fmt "%s\n", mal_log_level_color(_mal_level), mal_log_time_s(), mal_log_level_name(_mal_level), mal_rank(), ##__VA_ARGS__, mal_log_reset_color()); } while (0)
-#define MAL_LOG_L(level, tag, fmt, ...) do { MalLogLevel _mal_level = (level); if (mal_should_log(_mal_level)) printf("%s[%8.3f][%-6s][%-6s][R%d] | " fmt "%s\n", mal_log_level_color(_mal_level), mal_log_time_s(), mal_log_level_name(_mal_level), (tag), mal_rank(), ##__VA_ARGS__, mal_log_reset_color()); } while (0)
+#define MAL_LOG(level, fmt, ...) do { MalLogLevel _mal_level = (level); if (mal_should_log(_mal_level)) printf("[t=%10.4f][%-5s][R%d] | " fmt "\n", MPI_Wtime() - mal_t_origin(), mal_log_level_name(_mal_level), mal_rank(), ##__VA_ARGS__); } while (0)
+#define MAL_LOG_L(level, tag, fmt, ...) do { MalLogLevel _mal_level = (level); if (mal_should_log(_mal_level)) printf("[t=%10.4f][%-5s][%-6s][R%d] | " fmt "\n", MPI_Wtime() - mal_t_origin(), mal_log_level_name(_mal_level), (tag), mal_rank(), ##__VA_ARGS__); } while (0)
 
 struct MalVec;
 struct MalAcc;
@@ -64,7 +62,7 @@ enum MalDataAccessMode {
 enum MalResizePolicy {
 	MAL_RESIZE_POLICY_AUTO,
 	MAL_RESIZE_POLICY_THROUGHPUT,
-	MAL_RESIZE_POLICY_ENERGY,
+	MAL_RESIZE_POLICY_EFFICIENCY,
 	MAL_RESIZE_POLICY_FIXED_SEQUENCE,
 	MAL_RESIZE_POLICY_COST,
 };
@@ -86,9 +84,9 @@ struct alignas(64) MalFor {
 	long* user_iter{nullptr};
 	long* user_limit{nullptr};
 	std::atomic<MalLoopPhase> phase{MAL_LOOP_WAITING_ACTIVATION};
+	std::atomic<long> confirmed_iter{LONG_MIN};
 	size_t plan_idx{0};
-
-	char _cold_pad[8]{};
+	size_t check_counter{0};
 
 	std::vector<std::pair<long,long>> plan_ranges;
 	std::vector<long> plan_local_bases;
@@ -137,6 +135,7 @@ struct MalForND {
 	std::vector<long> decoded_idx;
 	long flat{0};
 	long flat_limit{0};
+	long last_flat{LONG_MIN};
 	bool done{true};
 
 	MalForND() = default;
@@ -164,6 +163,7 @@ struct MalForND {
 		decoded_idx = std::move(other.decoded_idx);
 		flat = other.flat;
 		flat_limit = other.flat_limit;
+		last_flat = other.last_flat;
 		done = other.done;
 
 		if (base) {

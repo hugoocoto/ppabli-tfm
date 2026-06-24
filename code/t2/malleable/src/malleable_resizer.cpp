@@ -2,13 +2,15 @@
 #define MALLEABLE_RESIZER_CPP_INCLUDED
 
 #include "malleable_types.cpp"
-#include "malleable_papi.cpp"
 
+constexpr double kEpsDone = 1.0;
 constexpr double kEpsElapsed = 1e-6;
 constexpr double kEpsThroughput = 1e-9;
 constexpr double kEpsWeight = 1e-12;
-constexpr double kEpsDone = 1.0;
-constexpr int kLbGatherFields = 5;
+constexpr int kLbGatherFields = 2;
+constexpr int kFusedGatherFields = 1 + kLbGatherFields;
+constexpr int kMinResizeCooldownEpochs = 2;
+constexpr int kMinBaselineEpochs = 3;
 
 inline const double* lb_row_at(const std::vector<double>& all_lb_buf, int k) {
 
@@ -19,12 +21,6 @@ inline const double* lb_row_at(const std::vector<double>& all_lb_buf, int k) {
 inline double lb_row_tp(const double* row) {
 
 	return (row[0] > 0.0 && row[1] > kEpsElapsed) ? (row[0] / row[1]) : 0.0;
-
-}
-
-inline double lb_row_ee(const double* row) {
-
-	return (row[2] > kEpsWeight) ? (1.0 / row[2]) : 0.0;
 
 }
 
@@ -41,10 +37,6 @@ class Resizer {
 	std::vector<long> target_cuts_;
 	long total_rem_{0};
 
-	// gathered: pool buffer with received slice. Owned by VecTask until either
-	// (a) consumed in apply_active() (memcpy then released by ~Resizer), or
-	// (b) moved to PendingActivation::vec_slices in waiting_for_activation path
-	// (then released by ~PendingActivation). After move, t.gathered = {} prevents double-free.
 	struct VecTask {
 		MalVec* v{nullptr};
 		StagedBuffer gathered;
@@ -67,16 +59,16 @@ class Resizer {
 	std::vector<int> flat_counts_buf_;
 	std::vector<int> flat_displs_buf_;
 	std::vector<double> all_lb_buf_;
+	std::vector<double> fused_gather_buf_;
 
-	void init_vec_meta(int nvecs, int n);
 	std::vector<TransferPlanEntry> build_transfer_plan(const std::vector<long>& old_vs) const;
 	void init_vec_tasks(int n, int nvecs, bool was_active);
 	void reserve_receiver_buffers(int n, bool am_receiver, const std::vector<TransferPlanEntry>& plan, long my_new_count, const std::vector<int>& all_reuse_flags) ;
 	void exchange_vec_data(int n, bool was_active, const std::vector<long>& old_vs, const std::vector<TransferPlanEntry>& plan, const std::vector<int>& all_reuse_flags);
 
 	void collect_ranges();
-	void redistribute_vecs();
-	void reduce_accs();
+	void redistribute_vecs(int n_vecs);
+	void reduce_accs(int n_accs);
 	void apply_active();
 	void apply_inactive();
 	void broadcast_shared_vecs();
@@ -87,6 +79,7 @@ class Resizer {
 	int old_a_size_{0};
 	long my_new_vs_{0};
 	long my_new_count_{0};
+	long confirmed_snapshot_{LONG_MIN};
 
 public:
 
@@ -111,304 +104,153 @@ public:
 
 };
 
-struct AutoResizeMetrics {
-
-	static constexpr int kIdxLocalRem = 0;
-	static constexpr int kIdxThr = 1;
-	static constexpr int kIdxDataBytes = 2;
-	static constexpr int kIdxActiveN = 3;
-	static constexpr int kIdxMemBound = 4;
-	static constexpr int kIdxEnergyEff = 5;
-	static constexpr int kDecFields = 6;
-	double local_rem{0.0};
-	double my_thr{0.0};
-	double my_data_bytes{0.0};
-	double my_mem_bound_local{0.0};
-	double my_energy_eff{0.0};
-	std::vector<double> per_rank_all;
-	std::vector<long> all_local_rem;
+struct EpochMetrics {
+	double global_thr{0.0};
 	double global_remaining{0.0};
-	double global_throughput_inst{0.0};
-	double max_data_bytes{0.0};
-	double global_energy_eff_mass{0.0};
-	double sum_mem_bound_w{0.0};
-	double sum_thr_w{0.0};
 	int active_n{0};
-	double mem_bound_fresh{0.0};
-	double global_throughput{0.0};
-
+	bool any_has_loop{false};
 };
 
-double energy_mix_from_metrics(double mem_bound_fresh, double throughput_mass, double energy_mass, double ipc_ewma, double ipc_peak_ref) {
+EpochMetrics gather_epoch_metrics() {
 
-	if (g.cfg.resize_policy == MAL_RESIZE_POLICY_THROUGHPUT) {
+	EpochMetrics m;
+	const int U = g.comm.u_size;
+	static thread_local std::vector<double> per_rank_thr;
+	per_rank_thr.assign((size_t)U, 0.0);
 
-		return 0.0;
-
-	}
-
-	const double throughput_pressure = std::clamp(throughput_mass / (throughput_mass + energy_mass + kEpsWeight), 0.0, 1.0);
-	const double ipc_pressure = std::clamp(1.0 - (ipc_peak_ref > kEpsWeight ? ipc_ewma / ipc_peak_ref : 0.0), 0.0, 1.0);
-	const double energy_pressure = std::clamp(mem_bound_fresh + ipc_pressure - mem_bound_fresh * ipc_pressure, 0.0, 1.0);
-	return energy_pressure / (energy_pressure + throughput_pressure + kEpsWeight);
-
-}
-
-struct ResizeCandidateEval {
-
-	int target_n{-1};
-	double T_next{0.0};
-	double transfer_cost{0.0};
-	double net_gain{0.0};
-	double rel_gain{0.0};
-	double score{0.0};
-	double predicted_cost{0.0};
-	double cost_rel_gain{0.0};
-	bool worthwhile{false};
-
-};
-
-void log_top_resize_candidates(const std::vector<ResizeCandidateEval>& all_candidates, int current_n) {
-
-	if (g.comm.u_rank != 0 || all_candidates.empty()) {
-
-		return;
-
-	}
-
-	const int top_n = std::min(3, (int)all_candidates.size());
-	std::array<int, 3> top_idx{-1, -1, -1};
-
-	for (int i = 0; i < (int)all_candidates.size(); i++) {
-
-		const double s = all_candidates[(size_t)i].score;
-
-		for (int t = 0; t < top_n; t++) {
-
-			if (top_idx[t] < 0 || s > all_candidates[(size_t)top_idx[t]].score) {
-
-				for (int u = top_n - 1; u > t; u--) top_idx[u] = top_idx[u - 1];
-				top_idx[t] = i;
-				break;
-
-			}
-
-		}
-
-	}
-
-	for (int t = 0; t < top_n; t++) {
-
-		if (top_idx[t] < 0) break;
-
-		const auto& c = all_candidates[(size_t)top_idx[t]];
-		const char* mode = (c.target_n == current_n) ? "rebalance" : ((c.target_n > current_n) ? "scale-up" : "scale-down");
-
-		MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Top candidate #%d: target=%d mode=%s score=%.4f rel=%.2f%% gain=%.4fs cost=%.4fs C(p)=%.4fps cost_rel=%.2f%%", t + 1, c.target_n, mode, c.score, c.rel_gain * 100.0, c.net_gain, c.transfer_cost, c.predicted_cost, c.cost_rel_gain * 100.0);
-
-	}
-
-}
-
-inline void push_candidate_target(std::vector<int>& out, std::vector<char>& seen, int target) {
-
-	if (target < 1 || target >= (int)seen.size()) {
-
-		return;
-
-	}
-
-	if (seen[(size_t)target]) {
-
-		return;
-
-	}
-
-	seen[(size_t)target] = 1;
-	out.push_back(target);
-
-}
-
-AutoResizeMetrics gather_auto_resize_metrics() {
-
-	AutoResizeMetrics m;
-	m.per_rank_all.assign((size_t)g.comm.u_size * AutoResizeMetrics::kDecFields, 0.0);
-	m.all_local_rem.assign((size_t)g.comm.u_size, 0);
+	double local_rem = 0.0;
 
 	if (g.loop && g.comm.active != MPI_COMM_NULL) {
 
-		long cur = *g.loop->user_iter;
+		const long cur = *g.loop->user_iter;
 
 		if (cur + 1 < g.loop->end) {
 
-			m.local_rem += g.loop->end - (cur + 1);
+			local_rem += (double)(g.loop->end - (cur + 1));
 
 		}
 
 		for (size_t ri = g.loop->plan_idx + 1; ri < g.loop->plan_ranges.size(); ri++) {
 
-			m.local_rem += g.loop->plan_ranges[ri].second - g.loop->plan_ranges[ri].first;
+			local_rem += (double)(g.loop->plan_ranges[ri].second - g.loop->plan_ranges[ri].first);
 
 		}
 
 	}
 
 	const double my_elapsed = MPI_Wtime() - g.lb.epoch_start_time;
-	const long my_done = std::max(0L, g.lb.epoch_assigned - (long)m.local_rem);
-	m.my_thr = (my_elapsed > kEpsElapsed && my_done > 0) ? (double)my_done / my_elapsed : 0.0;
+	const long my_done = std::max(0L, g.lb.epoch_assigned - (long)local_rem);
+	const double my_thr = (my_elapsed > kEpsElapsed && my_done > 0) ? (double)my_done / my_elapsed : 0.0;
+	const double my_active_n = (double)g.comm.a_size;
 
-	if (g.loop) {
+	const double my_has_loop = (g.loop && g.loop->phase.load(std::memory_order_relaxed) != MAL_LOOP_WAITING_ACTIVATION) ? 1.0 : 0.0;
+	constexpr int kGatherFields = 5;
+	double send[kGatherFields] = {local_rem, my_thr, my_active_n, my_elapsed, my_has_loop};
+	static thread_local std::vector<double> recv;
+	recv.assign((size_t)U * kGatherFields, 0.0);
+	MPI_Allgather(send, kGatherFields, MPI_DOUBLE, recv.data(), kGatherFields, MPI_DOUBLE, g.comm.universe);
 
-		for (MalVec* v : g.loop->vecs) {
+	for (int k = 0; k < U; k++) {
 
-			if (v && v->attach_policy == MAL_ATTACH_PARTITIONED) {
+		const double rem_k = recv[(size_t)k * kGatherFields + 0];
+		const double thr_k = recv[(size_t)k * kGatherFields + 1];
+		const int an_k = (int)std::lround(recv[(size_t)k * kGatherFields + 2]);
 
-				const long rem_local = std::max(0L, v->local_n - v->done_n);
-				m.my_data_bytes += (double)rem_local * (double)v->elem_size;
+		m.active_n = std::max(m.active_n, an_k);
+		m.global_remaining += rem_k;
+		per_rank_thr[(size_t)k] = thr_k;
+		if (recv[(size_t)k * kGatherFields + 4] > 0.5) m.any_has_loop = true;
+
+	}
+
+	for (int k = 0; k < m.active_n; k++) {
+
+		m.global_thr += per_rank_thr[(size_t)k];
+
+	}
+
+	const double r0_elapsed = recv[0 * kGatherFields + 3];
+
+	if (m.active_n == 1 && m.global_thr > kEpsThroughput) {
+
+		const double min_valid_s = std::max(0.02, g.cfg.epoch_ms.load(std::memory_order_relaxed) * 0.0005);
+
+		if (r0_elapsed >= min_valid_s) {
+
+			using Phase = MalState::LoadBalance::Phase;
+			const bool building = (g.lb.bs_phase == Phase::IDLE || g.lb.bs_phase == Phase::NEEDS_BASELINE);
+			const double alpha = building ? 0.5 : 0.9;
+
+			g.lb.thr_single_proc = (g.lb.thr_single_proc <= kEpsThroughput) ? m.global_thr : alpha * g.lb.thr_single_proc + (1.0 - alpha) * m.global_thr;
+
+			if (building) {
+
+				g.lb.bs_baseline_count++;
 
 			}
 
 		}
 
 	}
-
-	m.my_mem_bound_local = papi_mem_bound_fraction(g.lb.papi_prev_vals);
-	const double my_energy_per_iter = papi_energy_per_iter(g.lb.papi_prev_vals, my_done);
-	m.my_energy_eff = (my_energy_per_iter > kEpsWeight) ? (1.0 / my_energy_per_iter) : 0.0;
-	double per_rank_send[AutoResizeMetrics::kDecFields] = { m.local_rem, m.my_thr, m.my_data_bytes, (double)g.comm.a_size, m.my_mem_bound_local, m.my_energy_eff };
-	MPI_Allgather(per_rank_send, AutoResizeMetrics::kDecFields, MPI_DOUBLE, m.per_rank_all.data(), AutoResizeMetrics::kDecFields, MPI_DOUBLE, g.comm.universe);
-
-	for (int k = 0; k < g.comm.u_size; k++) {
-
-		const double* row = &m.per_rank_all[(size_t)k * AutoResizeMetrics::kDecFields];
-		m.all_local_rem[(size_t)k] = (long)std::llround(row[AutoResizeMetrics::kIdxLocalRem]);
-		m.global_remaining += row[AutoResizeMetrics::kIdxLocalRem];
-		const double thr_k = row[AutoResizeMetrics::kIdxThr];
-		m.global_throughput_inst += thr_k;
-		m.max_data_bytes = std::max(m.max_data_bytes, row[AutoResizeMetrics::kIdxDataBytes]);
-		m.active_n = std::max(m.active_n, (int)std::lround(row[AutoResizeMetrics::kIdxActiveN]));
-		m.global_energy_eff_mass += std::max(0.0, row[AutoResizeMetrics::kIdxEnergyEff]);
-
-		if (thr_k > kEpsWeight) {
-
-			m.sum_mem_bound_w += row[AutoResizeMetrics::kIdxMemBound] * thr_k;
-			m.sum_thr_w += thr_k;
-
-		}
-
-	}
-
-	m.mem_bound_fresh = (m.sum_thr_w > kEpsWeight) ? std::clamp(m.sum_mem_bound_w / m.sum_thr_w, 0.0, 1.0) : std::clamp(g.lb.global_mem_bound, 0.0, 1.0);
 
 	if (m.active_n > 0) {
 
 		std::lock_guard<std::mutex> lk(g.lb.weights_mu);
 
-		if ((int)g.lb.weights.size() < g.comm.u_size) {
+		if ((int)g.lb.weights.size() < U) {
 
-			g.lb.weights.assign((size_t)g.comm.u_size, 0.0);
-			const double init_w = 1.0 / (double)m.active_n;
-
-			for (int k = 0; k < m.active_n; k++) {
-
-				g.lb.weights[(size_t)k] = init_w;
-
-			}
+			g.lb.weights.assign((size_t)U, 0.0);
 
 		}
 
-		double thr_mass_active = 0.0;
+		if (m.global_thr > kEpsWeight) {
 
-		for (int k = 0; k < m.active_n; k++) {
+			for (int k = 0; k < U; k++) {
 
-			const double thr_k = std::max(0.0, m.per_rank_all[(size_t)k * AutoResizeMetrics::kDecFields + AutoResizeMetrics::kIdxThr]);
-			thr_mass_active += thr_k;
-
-		}
-
-		if (thr_mass_active > kEpsWeight) {
-
-			const double w_alpha = std::clamp(g.lb.alpha, kEpsElapsed, 1.0);
-
-			for (int k = 0; k < g.comm.u_size; k++) {
-
-				const double target_w =
-					(k < m.active_n)
-					? (std::max(0.0, m.per_rank_all[(size_t)k * AutoResizeMetrics::kDecFields + AutoResizeMetrics::kIdxThr]) / thr_mass_active)
-					: 0.0;
-
-				g.lb.weights[(size_t)k] = w_alpha * target_w + (1.0 - w_alpha) * g.lb.weights[(size_t)k];
+				g.lb.weights[(size_t)k] = (k < m.active_n) ? per_rank_thr[(size_t)k] / m.global_thr : 0.0;
 
 			}
-
-			double wsum = 0.0;
-
-			for (int k = 0; k < m.active_n; k++) {
-
-				wsum += std::max(0.0, g.lb.weights[(size_t)k]);
-
-			}
-
-			if (wsum > kEpsWeight) {
-
-				for (int k = 0; k < m.active_n; k++) {
-
-					g.lb.weights[(size_t)k] = std::max(0.0, g.lb.weights[(size_t)k]) / wsum;
-
-				}
-
-			} else {
-
-				const double uniform_w = 1.0 / (double)m.active_n;
-
-				for (int k = 0; k < m.active_n; k++) {
-
-					g.lb.weights[(size_t)k] = uniform_w;
-
-				}
-
-			}
-
-			for (int k = m.active_n; k < g.comm.u_size; k++) {
-
-				g.lb.weights[(size_t)k] = 0.0;
-
-			}
-
-		}
-
-	}
-
-	const double thr_ewma_alpha = std::clamp(g.cfg.auto_thr_ewma_alpha, kEpsElapsed, 1.0);
-
-	if (m.global_throughput_inst > kEpsWeight) {
-
-		if (g.lb.auto_thr_ewma <= kEpsWeight) {
-
-			g.lb.auto_thr_ewma = m.global_throughput_inst;
 
 		} else {
 
-			g.lb.auto_thr_ewma = thr_ewma_alpha * m.global_throughput_inst + (1.0 - thr_ewma_alpha) * g.lb.auto_thr_ewma;
+			const double w = 1.0 / (double)m.active_n;
+
+			for (int k = 0; k < U; k++) {
+
+				g.lb.weights[(size_t)k] = (k < m.active_n) ? w : 0.0;
+
+			}
 
 		}
 
 	}
-
-	m.global_throughput = (g.lb.auto_thr_ewma > kEpsWeight) ? g.lb.auto_thr_ewma : m.global_throughput_inst;
 
 	return m;
 
 }
+
+static double get_efficiency_threshold() {
+
+	switch (g.cfg.resize_policy) {
+		case MAL_RESIZE_POLICY_THROUGHPUT: return 0.0;
+		case MAL_RESIZE_POLICY_EFFICIENCY: return 0.8;
+		case MAL_RESIZE_POLICY_COST: return 0.9;
+		default: return 0.6;
+	}
+
+}
+
 
 void Resizer::collect_ranges() {
 
 	std::vector<long> local;
 	local.reserve(16);
 
+	confirmed_snapshot_ = (g.loop && g.comm.active != MPI_COMM_NULL) ? g.loop->confirmed_iter.load(std::memory_order_acquire) : LONG_MIN;
+
 	if (g.loop && g.comm.active != MPI_COMM_NULL) {
 
-		const long first_s = *g.loop->user_iter + 1;
+		const long first_s = confirmed_snapshot_ + 1;
 		const long first_e = g.loop->end;
 
 		if (first_s < first_e) {
@@ -436,9 +278,32 @@ void Resizer::collect_ranges() {
 
 	int my_count = (int)local.size();
 
-	flat_counts_buf_.resize(g.comm.u_size);
+	long my_rem_local = 0;
 
-	MPI_Allgather(&my_count, 1, MPI_INT, flat_counts_buf_.data(), 1, MPI_INT, g.comm.universe);
+	for (size_t i = 0; i + 1 < local.size(); i += 2) {
+
+		my_rem_local += local[i + 1] - local[i];
+
+	}
+
+	double my_elapsed = MPI_Wtime() - g.lb.epoch_start_time;
+	long my_done = std::max(0L, g.lb.epoch_assigned - my_rem_local);
+
+	double fused_send[kFusedGatherFields] = {(double)my_count, (double)my_done, my_elapsed};
+	fused_gather_buf_.resize((size_t)g.comm.u_size * (size_t)kFusedGatherFields);
+
+	MPI_Allgather(fused_send, kFusedGatherFields, MPI_DOUBLE, fused_gather_buf_.data(), kFusedGatherFields, MPI_DOUBLE, g.comm.universe);
+
+	flat_counts_buf_.resize(g.comm.u_size);
+	all_lb_buf_.resize((size_t)g.comm.u_size * (size_t)kLbGatherFields);
+
+	for (int k = 0; k < g.comm.u_size; k++) {
+
+		const double* row = &fused_gather_buf_[(size_t)k * (size_t)kFusedGatherFields];
+		flat_counts_buf_[k] = (int)row[0];
+		std::memcpy(&all_lb_buf_[(size_t)k * (size_t)kLbGatherFields], row + 1, kLbGatherFields * sizeof(double));
+
+	}
 
 	flat_displs_buf_ = make_displs(flat_counts_buf_);
 
@@ -450,7 +315,6 @@ void Resizer::collect_ranges() {
 		remaining_offsets_.assign(1, 0);
 		total_rem_ = 0;
 		rem_per_rank_.assign(g.comm.u_size, 0);
-		g.sync.stop = true;
 
 		return;
 
@@ -489,444 +353,67 @@ void Resizer::collect_ranges() {
 
 	}
 
-	if (total_rem_ == 0) {
+	{
 
-		g.sync.stop.store(true, std::memory_order_release);
+		std::lock_guard<std::mutex> lk(g.lb.weights_mu);
 
-	}
+		if ((int)g.lb.weights.size() < g.comm.u_size) {
 
-	double my_elapsed = MPI_Wtime() - g.lb.epoch_start_time;
-	long my_done = std::max(0L, g.lb.epoch_assigned - rem_per_rank_[g.comm.u_rank]);
-
-	double lbdata[kLbGatherFields] = {(double)my_done, my_elapsed, papi_energy_per_iter(g.lb.papi_prev_vals, my_done), papi_mem_bound_fraction(g.lb.papi_prev_vals), papi_ipc(g.lb.papi_prev_vals)};
-	all_lb_buf_.resize((size_t)g.comm.u_size * (size_t)kLbGatherFields);
-
-	MPI_Allgather(lbdata, kLbGatherFields, MPI_DOUBLE, all_lb_buf_.data(), kLbGatherFields, MPI_DOUBLE, g.comm.universe);
-
-	double total_tp = 0.0;
-	double total_ee = 0.0;
-
-	for (int k = 0; k < g.comm.u_size; k++) {
-
-		const double* row = lb_row_at(all_lb_buf_, k);
-		total_tp += lb_row_tp(row);
-		total_ee += lb_row_ee(row);
-
-	}
-
-	if (total_tp > 0.0) {
-
-		std::lock_guard<std::mutex> lk_w(g.lb.weights_mu);
-		const double thr_ewma_alpha_cr = std::clamp(g.cfg.auto_thr_ewma_alpha, kEpsElapsed, 1.0);
-
-		if (g.lb.auto_thr_ewma <= kEpsWeight) {
-
-			g.lb.auto_thr_ewma = total_tp;
-
-		} else {
-
-			g.lb.auto_thr_ewma = thr_ewma_alpha_cr * total_tp + (1.0 - thr_ewma_alpha_cr) * g.lb.auto_thr_ewma;
+			g.lb.weights.assign((size_t)g.comm.u_size, 0.0);
 
 		}
 
-		if (target_ > old_a_size_ && target_ > 0) {
+		const bool is_scale_up = (target_ > old_a_size_);
 
-			if ((int)g.lb.weights.size() < g.comm.u_size) {
+		if (is_scale_up) {
 
-				g.lb.weights.assign((size_t)g.comm.u_size, 0.0);
+			const double w = 1.0 / (double)std::max(1, target_);
+
+			for (int k = 0; k < g.comm.u_size; k++) {
+
+				g.lb.weights[(size_t)k] = (k < target_) ? w : 0.0;
 
 			}
 
-			double done_total = 0.0;
+		} else {
+
+			double total_tp = 0.0;
 
 			for (int k = 0; k < target_; k++) {
 
-				done_total += std::max(0.0, lb_row_at(all_lb_buf_, k)[0]);
+				total_tp += lb_row_tp(lb_row_at(all_lb_buf_, k));
 
 			}
 
-			const double target_work = (done_total + (double)total_rem_) / (double)target_;
-			double quota_sum = 0.0;
+			if (total_tp > kEpsWeight) {
 
-			for (int k = 0; k < g.comm.u_size; k++) {
+				for (int k = 0; k < g.comm.u_size; k++) {
 
-				double w_boot = 0.0;
-
-				if (k < target_) {
-
-					const double done_k = std::max(0.0, lb_row_at(all_lb_buf_, k)[0]);
-					w_boot = std::max(0.0, target_work - done_k);
-					quota_sum += w_boot;
-
-				}
-
-				g.lb.weights[(size_t)k] = w_boot;
-
-			}
-
-			if (quota_sum > kEpsWeight) {
-
-				for (int k = 0; k < target_; k++) {
-
-					g.lb.weights[(size_t)k] /= quota_sum;
+					g.lb.weights[(size_t)k] = (k < target_) ? lb_row_tp(lb_row_at(all_lb_buf_, k)) / total_tp : 0.0;
 
 				}
 
 			} else {
 
-				const double uniform_w = 1.0 / (double)target_;
+				const double w = 1.0 / (double)std::max(1, target_);
 
-				for (int k = 0; k < target_; k++) {
+				for (int k = 0; k < g.comm.u_size; k++) {
 
-					g.lb.weights[(size_t)k] = uniform_w;
-
-				}
-
-			}
-
-		} else {
-
-			if ((int)g.lb.weights.size() < g.comm.u_size) {
-
-				double fill;
-
-				if (g.lb.weights.empty()) {
-
-					fill = 1.0 / g.comm.u_size;
-
-				} else {
-
-					double sum = 0.0;
-
-					for (double wk : g.lb.weights) sum += wk;
-
-					fill = sum / (double)g.lb.weights.size();
-
-				}
-
-				g.lb.weights.resize(g.comm.u_size, fill);
-
-			}
-
-			const double energy_coeff = energy_mix_from_metrics(g.lb.global_mem_bound, total_tp, total_ee, g.lb.global_ipc_ewma, std::max({kEpsWeight, g.lb.ipc_peak_ref, g.lb.global_ipc_ewma}));
-			const bool use_energy = (energy_coeff > kEpsWeight && total_ee > kEpsWeight && papi_is_available());
-
-			for (int k = 0; k < g.comm.u_size; k++) {
-
-				const double* row = lb_row_at(all_lb_buf_, k);
-				const double tp_k = lb_row_tp(row);
-
-				if (tp_k > 0.0) {
-
-					const double norm_tp = tp_k / total_tp;
-					double blended = norm_tp;
-
-					if (use_energy) {
-
-						const double ee_k = lb_row_ee(row);
-
-						if (ee_k > 0.0) {
-
-							blended = (1.0 - energy_coeff) * norm_tp + energy_coeff * (ee_k / total_ee);
-
-						}
-
-					}
-
-					g.lb.weights[k] = g.lb.alpha * blended + (1.0 - g.lb.alpha) * g.lb.weights[k];
+					g.lb.weights[(size_t)k] = (k < target_) ? w : 0.0;
 
 				}
 
 			}
 
 		}
-
-		double mem_bound_sum = 0.0;
-		double ipc_sum = 0.0;
-		double papi_w_sum = 0.0;
-
-		for (int k = 0; k < g.comm.u_size; k++) {
-
-			const double* row = lb_row_at(all_lb_buf_, k);
-			const double tp_k = lb_row_tp(row);
-			const double mb = row[3];
-			const double ipc = row[4];
-
-			if (tp_k > kEpsWeight && (mb > kEpsWeight || ipc > kEpsWeight)) {
-
-				mem_bound_sum += mb * tp_k;
-				ipc_sum += ipc * tp_k;
-				papi_w_sum += tp_k;
-
-			}
-
-		}
-
-		if (papi_w_sum > kEpsWeight) {
-
-			g.lb.global_mem_bound = std::clamp(mem_bound_sum / papi_w_sum, 0.0, 1.0);
-			const double new_ipc = ipc_sum / papi_w_sum;
-			const double thr_alpha = std::clamp(g.cfg.auto_thr_ewma_alpha, kEpsElapsed, 1.0);
-
-			if (g.lb.ipc_peak_ref <= kEpsWeight) {
-
-				g.lb.ipc_peak_ref = new_ipc;
-
-			} else {
-
-				g.lb.ipc_peak_ref = std::max(new_ipc, thr_alpha * new_ipc + (1.0 - thr_alpha) * g.lb.ipc_peak_ref);
-
-			}
-
-			if (g.lb.global_ipc_ewma > kEpsWeight && new_ipc > kEpsWeight) {
-
-				const double rel_drop = (g.lb.global_ipc_ewma - new_ipc) / g.lb.global_ipc_ewma;
-				const double rel_drop_abs = std::fabs(rel_drop);
-				g.lb.ipc_drop_ewma = thr_alpha * rel_drop_abs + (1.0 - thr_alpha) * g.lb.ipc_drop_ewma;
-				const double drop_trigger = std::max(g.lb.ipc_drop_ewma, g.lb.auto_alpha_est_sec / (g.lb.auto_alpha_est_sec + std::max(my_elapsed, kEpsElapsed)));
-
-				if (rel_drop > drop_trigger) {
-
-					MAL_LOG_L(MAL_LOG_DEBUG, "LB", "Phase change detected: IPC %.2f to %.2f (drop=%.1f%%) — decaying weights", g.lb.global_ipc_ewma, new_ipc, rel_drop * 100.0);
-
-					const double decay = 1.0 - std::min(0.9, rel_drop);
-
-					for (auto& wk : g.lb.weights) {
-
-						wk *= decay;
-
-					}
-
-				}
-
-			}
-
-			if (g.lb.global_ipc_ewma <= kEpsWeight) {
-
-				g.lb.global_ipc_ewma = new_ipc;
-
-			} else {
-
-				g.lb.global_ipc_ewma = thr_alpha * new_ipc + (1.0 - thr_alpha) * g.lb.global_ipc_ewma;
-
-			}
-
-		}
-
-		const double* my_row = lb_row_at(all_lb_buf_, g.comm.u_rank);
-		const double my_mem_bound = my_row[3];
-		const double my_ipc = my_row[4];
-		MAL_LOG(MAL_LOG_DEBUG, "LB: epoch done=%ld elapsed=%.3fs thr=%.1f iters/s ipc=%.2f mem_bound=%.2f weight=%.4f", my_done, my_elapsed, my_done > 0 && my_elapsed > kEpsElapsed ? (double)my_done / my_elapsed : 0.0, my_ipc, my_mem_bound, g.comm.u_rank < (int)g.lb.weights.size() ? g.lb.weights[g.comm.u_rank] : 0.0);
 
 	}
+
+	const double* my_row = lb_row_at(all_lb_buf_, g.comm.u_rank);
+	MAL_LOG(MAL_LOG_DEBUG, "LB: epoch done=%.0f elapsed=%.3fs thr=%.1f iters/s weight=%.4f", my_row[0], my_row[1], lb_row_tp(my_row), g.comm.u_rank < (int)g.lb.weights.size() ? g.lb.weights[(size_t)g.comm.u_rank] : 0.0);
 
 }
 
-ResizeCandidateEval evaluate_resize_candidate(const AutoResizeMetrics& m, int current_n, int target_n, const std::vector<double>& rank_weight_fill, const std::vector<double>& rank_weight_prefix, bool active_weights_ok, double sum_w_active, double global_throughput, double global_remaining, double max_data_bytes, double bw, double sync_cost_base, double T_current, double mem_bound, double non_llc_stall, double energy_mix) {
-
-	ResizeCandidateEval eval;
-	eval.target_n = target_n;
-	const bool lb_enabled = g.cfg.load_balancing_enabled.load(std::memory_order_relaxed);
-
-	if (current_n <= 0 || target_n <= 0) {
-
-		return eval;
-
-	}
-
-	if (!lb_enabled && target_n == current_n) {
-
-		return eval;
-
-	}
-
-	const double target_sync_cost = sync_cost_base * std::log2(std::max(2.0, (double)target_n));
-	const int compare_n = std::max(current_n, target_n);
-	const double migration_cost_est = (bw > 0.0) ? max_data_bytes * (double)std::abs(target_n - current_n) / (double)compare_n / bw : 0.0;
-	const double migration_pressure = std::clamp((target_sync_cost + migration_cost_est) / (T_current + target_sync_cost + migration_cost_est + kEpsWeight), 0.0, 1.0);
-	const double utility_energy_mix = (g.cfg.resize_policy == MAL_RESIZE_POLICY_THROUGHPUT) ? 0.0 : ((g.cfg.resize_policy == MAL_RESIZE_POLICY_ENERGY) ? 1.0 : std::clamp(energy_mix, 0.0, 1.0));
-	double utility_throughput = 1.0 - utility_energy_mix;
-	double utility_energy = utility_energy_mix;
-	double utility_migration = std::clamp(migration_pressure, 0.0, 1.0) * std::max(kEpsWeight, g.lb.migration_aversion);
-
-	const double utility_norm = utility_throughput + utility_energy + utility_migration;
-
-	if (utility_norm > kEpsWeight) {
-
-		utility_throughput /= utility_norm;
-		utility_energy /= utility_norm;
-		utility_migration /= utility_norm;
-
-	}
-
-	const double roofline_exponent = std::clamp(energy_mix, 0.0, 1.0);
-
-	if (target_n == current_n && g.lb.same_size_rebalance_cooldown > 0) {
-
-		return eval;
-
-	}
-
-	double next_time = T_current;
-	double transfer_cost = target_sync_cost + migration_cost_est;
-
-	if (target_n == current_n) {
-
-		double T_bal = 0.0;
-		double moved_iters_l1 = 0.0;
-
-		for (int k = 0; k < current_n; k++) {
-
-			const long rk = m.all_local_rem[(size_t)k];
-			const double share = (active_weights_ok && sum_w_active > kEpsThroughput) ? (rank_weight_fill[(size_t)k] / sum_w_active) : (1.0 / (double)current_n);
-			const double speed = std::max(kEpsWeight, global_throughput * share);
-			const double expected = global_remaining * share;
-
-			T_bal = std::max(T_bal, expected / speed);
-			moved_iters_l1 += std::fabs((double)rk - expected);
-
-		}
-
-		const double moved_iters = 0.5 * moved_iters_l1;
-		const double moved_bytes = (global_remaining > kEpsThroughput) ? (max_data_bytes * moved_iters / global_remaining) : 0.0;
-		next_time = T_bal;
-		transfer_cost = target_sync_cost + ((bw > 0.0) ? (moved_bytes / bw) : 0.0);
-
-	} else {
-
-		const double candidate_weight_mass = rank_weight_prefix[(size_t)target_n];
-		const double speedup_ideal = (active_weights_ok && sum_w_active > kEpsThroughput) ? candidate_weight_mass / sum_w_active : (double)target_n / (double)current_n;
-		const double mb_target = mem_bound * std::pow((double)current_n / (double)target_n, roofline_exponent);
-		const double eff_stall = std::min(1.0, mb_target + non_llc_stall);
-		const double speedup = 1.0 + (speedup_ideal - 1.0) * std::max(0.0, 1.0 - eff_stall);
-
-		next_time = (speedup > kEpsWeight) ? T_current / speedup : T_current;
-
-		if (active_weights_ok && sum_w_active > kEpsWeight) {
-
-			double bottleneck = 0.0;
-			const int load_n = std::min(current_n, target_n);
-			const double rem_share = global_remaining / (double)target_n;
-
-			for (int k = 0; k < load_n; k++) {
-
-				const double speed_k = global_throughput * rank_weight_fill[(size_t)k] / sum_w_active;
-
-				if (speed_k <= kEpsWeight) {
-
-					continue;
-
-				}
-
-				const double mb_k = std::clamp(m.per_rank_all[(size_t)k * AutoResizeMetrics::kDecFields + AutoResizeMetrics::kIdxMemBound], 0.0, 1.0);
-				const double mb_k_target = mb_k * std::pow((double)current_n / (double)target_n, roofline_exponent);
-				const double eff_k = std::min(1.0, mb_k_target + non_llc_stall);
-				const double speedup_k = 1.0 + (speedup_ideal - 1.0) * std::max(0.0, 1.0 - eff_k);
-				const double speed_k_target = speed_k * std::max(1.0, speedup_k);
-
-				bottleneck = std::max(bottleneck, rem_share / speed_k_target);
-
-			}
-
-			if (bottleneck > kEpsElapsed) {
-
-				next_time = bottleneck;
-
-			}
-
-		}
-
-	}
-
-	const double current_energy_proxy = std::max((double)current_n * T_current, kEpsThroughput);
-	const double next_energy_proxy = std::max((double)target_n * next_time, kEpsThroughput);
-	const double throughput_gain = std::max(0.0, (T_current - next_time) / std::max(T_current, kEpsThroughput));
-	const double energy_gain = std::max(0.0, (current_energy_proxy - next_energy_proxy) / current_energy_proxy);
-	const double transfer_norm = transfer_cost / std::max(T_current, kEpsThroughput);
-	const double phase_factor = T_current / (T_current + transfer_cost + kEpsThroughput);
-
-	eval.T_next = next_time;
-	eval.transfer_cost = transfer_cost;
-	eval.net_gain = T_current - (eval.T_next + eval.transfer_cost);
-	eval.rel_gain = (T_current > kEpsThroughput) ? (eval.net_gain / T_current) : 0.0;
-	eval.score = phase_factor * (utility_throughput * throughput_gain + utility_energy * energy_gain - utility_migration * transfer_norm);
-
-	// Cost model C(p) = p * T_par(p). Add transfer_cost into prediction so policy
-	// pays the migration overhead like real wall time would.
-	const double current_cost = std::max(kEpsThroughput, (double)current_n * T_current);
-	eval.predicted_cost = (double)target_n * (eval.T_next + eval.transfer_cost);
-	eval.cost_rel_gain = (current_cost - eval.predicted_cost) / current_cost;
-
-	if (g.cfg.resize_policy == MAL_RESIZE_POLICY_COST) {
-
-		// Replace utility-based score with cost reduction ratio. Cap migration penalty
-		// implicitly because predicted_cost already includes transfer_cost.
-		eval.score = phase_factor * eval.cost_rel_gain;
-		eval.worthwhile = eval.cost_rel_gain > 0.0 && eval.net_gain > -transfer_cost;
-
-	} else {
-
-		eval.worthwhile = eval.score > 0.0 && eval.net_gain > 0.0;
-
-	}
-
-	return eval;
-
-
-}
-
-void maybe_report_realized_benefit(const AutoResizeMetrics& m) {
-
-	if (!g.lb.post_eval_pending) {
-
-		return;
-
-	}
-
-	const double elapsed = std::max(kEpsElapsed, MPI_Wtime() - g.lb.post_eval_decision_time);
-	const double baseline_thr = std::max(kEpsThroughput, g.lb.post_eval_baseline_thr);
-	const double baseline_remaining = std::max(0.0, g.lb.post_eval_baseline_remaining);
-
-	const double actual_progress = std::max(0.0, baseline_remaining - m.global_remaining);
-	const double expected_progress_no_change = baseline_thr * elapsed;
-	const double extra_progress = actual_progress - expected_progress_no_change;
-	const double realized_gain_sec = extra_progress / std::max(m.global_throughput_inst, kEpsThroughput);
-	const double realized_thr_gain = (m.global_throughput_inst - baseline_thr) / baseline_thr;
-
-	const double lr = std::clamp(g.cfg.auto_calibration_alpha, kEpsElapsed, 1.0);
-	const double pred_gain = g.lb.post_eval_pred_net_gain;
-	const double pred_abs = std::max(std::fabs(pred_gain), kEpsElapsed);
-	const double trust_sample = std::clamp(0.5 + 0.5 * realized_gain_sec / pred_abs, 0.0, 1.0);
-
-	g.lb.benefit_trust = lr * trust_sample + (1.0 - lr) * g.lb.benefit_trust;
-
-	const double predicted_positive = std::max(0.0, pred_gain);
-	const double realized_positive = std::max(0.0, realized_gain_sec);
-	const double rel_error = (predicted_positive - realized_positive) / (predicted_positive + realized_positive + kEpsElapsed);
-	const double aversion_step = std::exp(lr * rel_error);
-
-	g.lb.migration_aversion = std::clamp(g.lb.migration_aversion * aversion_step, kEpsWeight, 5.0);
-
-	MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Post-commit eval %d->%d: pred(net=%.4fs rel=%.2f%% score=%.4f) realized(thr=%.2f%% gain=%.4fs progress=%.2f/%.2f iters elapsed=%.3fs trust=%.3f mig_aversion=%.3f)", g.lb.post_eval_from_n, g.lb.post_eval_to_n, g.lb.post_eval_pred_net_gain, g.lb.post_eval_pred_rel_gain * 100.0, g.lb.post_eval_pred_score, realized_thr_gain * 100.0, realized_gain_sec, actual_progress, expected_progress_no_change, elapsed, g.lb.benefit_trust, g.lb.migration_aversion);
-
-	g.lb.post_eval_pending = false;
-
-}
-
-void Resizer::init_vec_meta(int nvecs, int n) {
-
-	vmeta_.resize(n);
-
-	for (int vi = 0; vi < nvecs; vi++) {
-
-		vmeta_[vi].esz = g.loop->vecs[vi]->elem_size;
-		vmeta_[vi].shared_active = (g.loop->vecs[vi]->attach_policy == MAL_ATTACH_SHARED_ACTIVE) ? 1 : 0;
-
-	}
-
-	MPI_Bcast(vmeta_.data(), n * (int)sizeof(VecMeta), MPI_BYTE, 0, g.comm.universe);
-
-}
 
 std::vector<TransferPlanEntry> Resizer::build_transfer_plan(const std::vector<long>& old_vs) const {
 
@@ -1005,11 +492,11 @@ void Resizer::init_vec_tasks(int n, int nvecs, bool was_active) {
 
 	for (int vi = 0; vi < n; vi++) {
 
-			auto& t = vtasks_[vi];
+		auto& t = vtasks_[vi];
 
-			t.v = (vi < nvecs) ? g.loop->vecs[vi] : nullptr;
-			t.gathered = g.gather_cache[(size_t)vi];
-			g.gather_cache[(size_t)vi] = {};
+		t.v = (vi < nvecs) ? g.loop->vecs[vi] : nullptr;
+		t.gathered = g.gather_cache[(size_t)vi];
+		g.gather_cache[(size_t)vi] = {};
 
 		if (vmeta_[vi].shared_active) {
 
@@ -1034,7 +521,7 @@ void Resizer::init_vec_tasks(int n, int nvecs, bool was_active) {
 
 		if (was_active) {
 
-			new_done = std::clamp(*g.loop->user_iter - t.v->buf_global_start + 1, 0L, t.v->local_n);
+			new_done = std::clamp(confirmed_snapshot_ + 1 - t.v->buf_global_start, 0L, t.v->local_n);
 
 		}
 
@@ -1088,12 +575,12 @@ void Resizer::reserve_receiver_buffers(int n, bool am_receiver, const std::vecto
 
 		}
 
-			size_t bytes = (size_t)my_new_count * vmeta_[vi].esz;
-			void* gp = vtasks_[vi].gathered.ptr;
-			size_t gc = vtasks_[vi].gathered.bytes;
+		size_t bytes = (size_t)my_new_count * vmeta_[vi].esz;
+		void* gp = vtasks_[vi].gathered.ptr;
+		size_t gc = vtasks_[vi].gathered.bytes;
 
-			pool_reserve(gp, gc, bytes, /*preserve_data=*/false);
-			vtasks_[vi].gathered = {gp, gc};
+		pool_reserve(gp, gc, bytes, /*preserve_data=*/false);
+		vtasks_[vi].gathered = {gp, gc};
 
 	}
 
@@ -1186,6 +673,7 @@ void Resizer::exchange_vec_data(int n, bool was_active, const std::vector<long>&
 		}
 
 		size_t packed_bytes = 0;
+		int eligible_vecs = 0;
 
 		for (int vi = 0; vi < n; vi++) {
 
@@ -1195,7 +683,14 @@ void Resizer::exchange_vec_data(int n, bool was_active, const std::vector<long>&
 
 			}
 
-			packed_bytes += (size_t)tr.v_count * vmeta_[vi].esz;
+			const size_t b = (size_t)tr.v_count * vmeta_[vi].esz;
+
+			if (b > 0) {
+
+				packed_bytes += b;
+				eligible_vecs++;
+
+			}
 
 		}
 
@@ -1205,7 +700,7 @@ void Resizer::exchange_vec_data(int n, bool was_active, const std::vector<long>&
 
 		}
 
-		if (packed_bytes > (size_t)INT_MAX) {
+		if (packed_bytes > (size_t)INT_MAX || eligible_vecs == 1) {
 
 			for (int vi = 0; vi < n; vi++) {
 
@@ -1402,12 +897,7 @@ void Resizer::exchange_vec_data(int n, bool was_active, const std::vector<long>&
 
 }
 
-void Resizer::redistribute_vecs() {
-
-	int nvecs = g.loop ? (int)g.loop->vecs.size() : 0;
-	int n = nvecs;
-
-	MPI_Bcast(&n, 1, MPI_INT, 0, g.comm.universe);
+void Resizer::redistribute_vecs(int n) {
 
 	if (n == 0) {
 
@@ -1415,7 +905,7 @@ void Resizer::redistribute_vecs() {
 
 	}
 
-	init_vec_meta(nvecs, n);
+	int nvecs = g.loop ? (int)g.loop->vecs.size() : 0;
 
 	std::vector<long> old_vs(g.comm.u_size + 1, 0);
 	std::inclusive_scan(rem_per_rank_.begin(), rem_per_rank_.end(), old_vs.begin() + 1);
@@ -1479,22 +969,94 @@ void Resizer::redistribute_vecs() {
 	MPI_Allgather(scratch_reuse_flags_.data(), n, MPI_INT, scratch_all_reuse_flags_.data(), n, MPI_INT, g.comm.universe);
 
 	reserve_receiver_buffers(n, am_receiver, plan, my_new_count_, scratch_all_reuse_flags_);
-	exchange_vec_data(n, was_active, old_vs, plan, scratch_all_reuse_flags_);
+
+	int n_sources = 0;
+	int source_rank = -1;
+
+	for (int k = 0; k < g.comm.u_size; k++) {
+
+		if (rem_per_rank_[k] > 0) {
+
+			n_sources++;
+			source_rank = k;
+
+		}
+
+	}
+
+	if (n_sources == 1 && target_ > 1) {
+
+		std::vector<int> scounts(g.comm.u_size, 0);
+		std::vector<int> sdispls(g.comm.u_size, 0);
+
+		for (int vi = 0; vi < n; vi++) {
+
+			if (vmeta_[vi].shared_active) {
+
+				continue;
+
+			}
+
+			const size_t esz = vmeta_[vi].esz;
+			auto& t = vtasks_[vi];
+
+			const char* sendbuf = nullptr;
+
+			if (g.comm.u_rank == source_rank && t.v && was_active) {
+
+				sendbuf = static_cast<char*>(t.v->buf) + t.v->done_n * (long)esz;
+
+				for (int j = 0; j < target_; j++) {
+
+					if (reuse_flag_at(scratch_all_reuse_flags_, n, j, vi)) {
+
+						scounts[j] = 0;
+						sdispls[j] = 0;
+
+					} else {
+
+						long count = target_cuts_[(size_t)j + 1] - target_cuts_[(size_t)j];
+						long bytes = count * (long)esz;
+
+						scounts[j] = (bytes <= INT_MAX) ? (int)bytes : 0;
+						sdispls[j] = (int)(target_cuts_[(size_t)j] * (long)esz);
+
+					}
+
+				}
+
+				for (int j = target_; j < g.comm.u_size; j++) {
+
+					scounts[j] = 0;
+					sdispls[j] = 0;
+
+				}
+
+			}
+
+			int recvcount = (am_receiver && my_new_count_ > 0 && t.gathered.ptr) ? (int)(my_new_count_ * (long)esz) : 0;
+
+			MPI_Scatterv(sendbuf, scounts.data(), sdispls.data(), MPI_BYTE, t.gathered.ptr, recvcount, MPI_BYTE, source_rank, g.comm.universe);
+
+		}
+
+	} else {
+
+		exchange_vec_data(n, was_active, old_vs, plan, scratch_all_reuse_flags_);
+
+	}
 
 }
 
-void Resizer::reduce_accs() {
-
-	int naccs = g.loop ? (int)g.loop->accs.size() : 0;
-	int n = naccs;
-
-	MPI_Bcast(&n, 1, MPI_INT, 0, g.comm.universe);
+void Resizer::reduce_accs(int n) {
 
 	if (n == 0) {
 
 		return;
 
 	}
+
+	int naccs = g.loop ? (int)g.loop->accs.size() : 0;
 
 	new_epoch_bufs_.resize(n);
 	std::vector<MalAcc*>& loop_accs = g.loop->accs;
@@ -1531,7 +1093,7 @@ void Resizer::reduce_accs() {
 			MalAcc* a = (*accs)[(size_t)k];
 
 			a->epoch_buf.assign(r, r + esz);
-			a->fn_reset(a->ptr);
+			write_identity(static_cast<char*>(a->ptr), a->dtype_idx, a->dop_idx, (int)a->esz);
 
 		}
 
@@ -1543,7 +1105,13 @@ void Resizer::reduce_accs() {
 
 void Resizer::apply_active() {
 
-	const std::vector<long>& active_cuts = (g.comm.a_size == target_ && target_cuts_.size() == (size_t)g.comm.a_size + 1) ? target_cuts_ : (target_cuts_ = build_partition_cuts(total_rem_, g.comm.a_size));
+	if (target_cuts_.size() != (size_t)g.comm.a_size + 1) {
+
+		target_cuts_ = build_partition_cuts(total_rem_, g.comm.a_size);
+
+	}
+
+	const std::vector<long>& active_cuts = target_cuts_;
 	long vstart = active_cuts[(size_t)g.comm.a_rank];
 	long vend = active_cuts[(size_t)g.comm.a_rank + 1];
 	scratch_assigned_ = slice_remaining(remaining_, remaining_offsets_, vstart, vend);
@@ -1573,7 +1141,7 @@ void Resizer::apply_active() {
 
 			}
 
-			if (t.v->attach_policy == MAL_ATTACH_SHARED_ACTIVE) {
+			if (t.v->attach_policy == MAL_ATTACH_SHARED_ACTIVE || t.v->attach_policy == MAL_ATTACH_SHARED_ALL) {
 
 				configure_shared_active_vec(*t.v, (size_t)std::max(1L, t.v->total_N) * vmeta_[ti].esz);
 
@@ -1604,7 +1172,7 @@ void Resizer::apply_active() {
 
 					if (len > 0 && gathered_off + len <= my_new_count_) {
 
-							std::memcpy(static_cast<char*>(t.v->buf) + buf_off * vmeta_[ti].esz, static_cast<char*>(t.gathered.ptr) + gathered_off * vmeta_[ti].esz, len * vmeta_[ti].esz);
+						std::memcpy(static_cast<char*>(t.v->buf) + buf_off * vmeta_[ti].esz, static_cast<char*>(t.gathered.ptr) + gathered_off * vmeta_[ti].esz, len * vmeta_[ti].esz);
 
 					}
 
@@ -1633,7 +1201,9 @@ void Resizer::apply_active() {
 
 			install_loop_plan(*g.loop, assigned);
 			set_limit(*g.loop, g.loop->end);
-			set_iter (*g.loop, g.loop->start);
+			set_iter (*g.loop, g.loop->start - 1);
+
+			g.loop->confirmed_iter.store(g.loop->start - 1, std::memory_order_release);
 			g.sync.loop_has_new_work.store(true, std::memory_order_release);
 
 		} else {
@@ -1654,10 +1224,10 @@ void Resizer::apply_active() {
 
 			auto& t = vtasks_[vi];
 
-				if (new_asgn > 0 && t.gathered.ptr && vmeta_[vi].esz > 0) {
+			if (new_asgn > 0 && t.gathered.ptr && vmeta_[vi].esz > 0) {
 
-					pa->vec_slices[(size_t)vi] = t.gathered;
-					t.gathered = {};
+				pa->vec_slices[(size_t)vi] = t.gathered;
+				t.gathered = {};
 
 			}
 
@@ -1726,18 +1296,64 @@ void Resizer::broadcast_shared_mats() {
 
 	mpi_bcast_bytes(tots.data(), (size_t)n_shared * sizeof(size_t), 0, g.comm.active);
 
+	constexpr int kSharedMatTagBase = 0x2000;
+
+	auto entry_needed = [](unsigned long long mask, int si) {
+
+		return si >= 64 || ((mask >> si) & 1ull) != 0;
+
+	};
+
+	unsigned long long my_need = 0;
+
 	if (is_new) {
 
-		PendingActivation& pa = ensure_pending_activation();
-		pa.shared_mats.reserve(pa.shared_mats.size() + (size_t)n_shared);
+		for (int si = 0; si < n_shared && si < 64; si++) {
+
+			SharedMat* sm = (si < (int)g.shared.size()) ? g.shared[(size_t)si].get() : nullptr;
+
+			if (!(sm && sm->buf && sm->total_bytes == tots[si])) {
+
+				my_need |= (1ull << si);
+
+			}
+
+		}
+
+	}
+
+	std::vector<unsigned long long> all_need((size_t)g.comm.a_size, 0);
+	MPI_Allgather(&my_need, 1, MPI_UNSIGNED_LONG_LONG, all_need.data(), 1, MPI_UNSIGNED_LONG_LONG, g.comm.active);
+
+	if (is_new) {
 
 		for (int si = 0; si < n_shared; si++) {
 
 			const size_t tot = tots[si];
 			const size_t cap = tot > 0 ? tot : 1;
+			SharedMat* sm = (si < (int)g.shared.size()) ? g.shared[(size_t)si].get() : nullptr;
+
+			if (sm && sm->buf && sm->total_bytes == tot) {
+
+				if (tot > 0 && entry_needed(my_need, si)) {
+
+					mpi_recv_bytes(sm->buf, tot, 0, kSharedMatTagBase + si, g.comm.active);
+
+				}
+
+				continue;
+
+			}
+
+			PendingActivation& pa = ensure_pending_activation();
 			void* buf = g_buffer_pool.acquire(cap);
 
-			mpi_bcast_bytes(buf, tot, 0, g.comm.active);
+			if (tot > 0) {
+
+				mpi_recv_bytes(buf, tot, 0, kSharedMatTagBase + si, g.comm.active);
+
+			}
+
 			pa.shared_mats.push_back({buf, cap});
 
 		}
@@ -1746,34 +1362,27 @@ void Resizer::broadcast_shared_mats() {
 
 	}
 
-	for (int si = 0; si < n_shared; si++) {
+	if (g.comm.a_rank != 0) {
 
-		const size_t tot = tots[si];
-		const size_t cap = tot > 0 ? tot : 1;
-		SharedMat* sm = get_shared_mat_or_abort(si);
+		return;
 
-		if (!sm->buf || sm->total_bytes != tot) {
+	}
 
-			if (!sm->user_owned && sm->buf) {
+	for (int nr = old_a_size_; nr < target_; nr++) {
 
-				g_buffer_pool.release(sm->buf, sm->total_bytes > 0 ? sm->total_bytes : 1);
+		for (int si = 0; si < n_shared; si++) {
+
+			const size_t tot = tots[si];
+
+			if (tot == 0 || !entry_needed(all_need[(size_t)nr], si)) {
+
+				continue;
 
 			}
 
-			sm->buf = g_buffer_pool.acquire(cap);
-			sm->user_owned = false;
+			mpi_send_bytes(get_shared_mat_or_abort(si)->buf, tot, nr, kSharedMatTagBase + si, g.comm.active);
 
 		}
-
-		sm->total_bytes = tot;
-
-		if (sm->user_ptr) {
-
-			*sm->user_ptr = sm->buf;
-
-		}
-
-		mpi_bcast_bytes(sm->buf, tot, 0, g.comm.active);
 
 	}
 
@@ -1802,7 +1411,7 @@ void Resizer::broadcast_shared_vecs() {
 
 			MalVec* v = g.vecs[i].get();
 
-			if (!v || v->attach_policy != MAL_ATTACH_SHARED_ACTIVE) {
+			if (!v || (v->attach_policy != MAL_ATTACH_SHARED_ACTIVE && v->attach_policy != MAL_ATTACH_SHARED_ALL)) {
 
 				continue;
 
@@ -1835,32 +1444,124 @@ void Resizer::broadcast_shared_vecs() {
 	shared_meta.resize(n);
 	MPI_Bcast(shared_meta.data(), n * (int)sizeof(SharedVecBroadcast), MPI_BYTE, 0, g.comm.active);
 
-	for (const auto& meta : shared_meta) {
+	const bool is_new = (g.comm.u_rank >= old_a_size_ && g.comm.u_rank < target_);
+	constexpr int kSharedVecTagBase = 0x1000;
 
-		int vi = meta.index;
-		int nbytes = meta.bytes;
+	auto entry_needed = [](unsigned long long mask, int mi) {
 
-		if (MAL_UNLIKELY(vi < 0 || vi >= (int)g.vecs.size())) {
+		return mi >= 64 || ((mask >> mi) & 1ull) != 0;
 
-			MAL_LOG_L(MAL_LOG_ERROR, "RESIZE", "Shared-active vector index out of range: %d", vi);
-			MPI_Abort(g.comm.universe, 1);
+	};
+
+	unsigned long long my_need = 0;
+
+	if (is_new) {
+
+		for (int mi = 0; mi < n; mi++) {
+
+			if (mi >= 64) {
+
+				break;
+
+			}
+
+			const int vi = shared_meta[(size_t)mi].index;
+			const int nbytes = shared_meta[(size_t)mi].bytes;
+			MalVec* v = (vi >= 0 && vi < (int)g.vecs.size()) ? g.vecs[(size_t)vi].get() : nullptr;
+
+			const bool reusable = v && v->attach_policy == MAL_ATTACH_SHARED_ALL && v->access_mode == MAL_ACCESS_READ_ONLY && v->buf && v->local_n == v->total_N && (size_t)std::max(0, nbytes) <= (size_t)std::max(1L, v->total_N) * v->elem_size;
+
+			if (!reusable) {
+
+				my_need |= (1ull << mi);
+
+			}
 
 		}
 
-		MalVec* v = g.vecs[vi].get();
+	}
 
-		if (MAL_UNLIKELY(!v)) {
+	std::vector<unsigned long long> all_need((size_t)g.comm.a_size, 0);
+	MPI_Allgather(&my_need, 1, MPI_UNSIGNED_LONG_LONG, all_need.data(), 1, MPI_UNSIGNED_LONG_LONG, g.comm.active);
 
-			MAL_LOG_L(MAL_LOG_ERROR, "RESIZE", "Shared-active vector missing at index %d", vi);
-			MPI_Abort(g.comm.universe, 1);
+	if (is_new) {
+
+		for (int mi = 0; mi < n; mi++) {
+
+			const int vi = shared_meta[(size_t)mi].index;
+			const int nbytes = shared_meta[(size_t)mi].bytes;
+
+			MalVec* v = (vi >= 0 && vi < (int)g.vecs.size()) ? g.vecs[(size_t)vi].get() : nullptr;
+			const bool have_vec = v && (v->attach_policy == MAL_ATTACH_SHARED_ACTIVE || v->attach_policy == MAL_ATTACH_SHARED_ALL);
+
+			if (have_vec) {
+
+				const size_t buf_need = (size_t)std::max(1L, v->total_N) * v->elem_size;
+
+				if (MAL_UNLIKELY((size_t)std::max(0, nbytes) > buf_need)) {
+
+					MAL_LOG_L(MAL_LOG_ERROR, "RESIZE", "Shared vector size mismatch at index %d (%d > %zu)", vi, nbytes, buf_need);
+					MPI_Abort(g.comm.universe, 1);
+
+				}
+
+				configure_shared_active_vec(*v, buf_need);
+
+				if (nbytes > 0 && entry_needed(my_need, mi)) {
+
+					mpi_recv_bytes(v->buf, (size_t)nbytes, 0, kSharedVecTagBase + mi, g.comm.active);
+
+				}
+
+				continue;
+
+			}
+
+			PendingActivation& pa = ensure_pending_activation();
+			const size_t cap = nbytes > 0 ? (size_t)nbytes : 1;
+			void* buf = g_buffer_pool.acquire(cap);
+
+			if (nbytes > 0) {
+
+				mpi_recv_bytes(buf, (size_t)nbytes, 0, kSharedVecTagBase + mi, g.comm.active);
+
+			}
+
+			pa.shared_vecs.push_back({buf, cap});
 
 		}
 
-		configure_shared_active_vec(*v, (size_t)std::max(1L, v->total_N) * v->elem_size);
+		return;
 
-		if (nbytes > 0) {
+	}
 
-			mpi_bcast_bytes(v->buf, (size_t)nbytes, 0, g.comm.active);
+	if (g.comm.a_rank != 0) {
+
+		return;
+
+	}
+
+	for (int nr = old_a_size_; nr < target_; nr++) {
+
+		for (int mi = 0; mi < n; mi++) {
+
+			const int vi = shared_meta[(size_t)mi].index;
+			const int nbytes = shared_meta[(size_t)mi].bytes;
+
+			if (nbytes <= 0 || !entry_needed(all_need[(size_t)nr], mi)) {
+
+				continue;
+
+			}
+
+			if (MAL_UNLIKELY(vi < 0 || vi >= (int)g.vecs.size() || !g.vecs[(size_t)vi])) {
+
+				MAL_LOG_L(MAL_LOG_ERROR, "RESIZE", "Shared-active vector index out of range: %d", vi);
+				MPI_Abort(g.comm.universe, 1);
+
+			}
+
+			mpi_send_bytes(g.vecs[(size_t)vi]->buf, (size_t)nbytes, nr, kSharedVecTagBase + mi, g.comm.active);
 
 		}
 
@@ -1887,6 +1588,14 @@ void Resizer::apply_inactive() {
 		if (t.v->attach_policy == MAL_ATTACH_SHARED_ACTIVE) {
 
 			release_shared_active_vec(*t.v);
+
+			continue;
+
+		}
+
+		if (t.v->attach_policy == MAL_ATTACH_SHARED_ALL) {
+
+			configure_shared_active_vec(*t.v, (size_t)std::max(1L, t.v->total_N) * t.v->elem_size);
 
 			continue;
 
@@ -1926,8 +1635,8 @@ void Resizer::stash_gather_cache() {
 
 	for (size_t i = 0; i < vtasks_.size(); i++) {
 
-			auto& t = vtasks_[i];
-			auto& c = g.gather_cache[i];
+		auto& t = vtasks_[i];
+		auto& c = g.gather_cache[i];
 
 		if (c.ptr) {
 
@@ -1935,8 +1644,8 @@ void Resizer::stash_gather_cache() {
 
 		}
 
-			c = t.gathered;
-			t.gathered = {};
+		c = t.gathered;
+		t.gathered = {};
 
 	}
 
@@ -1948,23 +1657,96 @@ void Resizer::prepare_phase() {
 	MAL_LOG_L(MAL_LOG_DEBUG, "RESIZE", "Prepare phase start target=%d (active=%d)", target_, g.comm.a_size);
 
 	old_a_size_ = g.comm.a_size;
+	MPI_Bcast(&old_a_size_, 1, MPI_INT, 0, g.comm.universe);
 
 	collect_ranges();
-	redistribute_vecs();
-	reduce_accs();
 
-	MAL_LOG_L(MAL_LOG_DEBUG, "RESIZE", "Prepare phase done target=%d in %.4f s", target_, MPI_Wtime() - t0);
+	int nvecs = g.loop ? (int)g.loop->vecs.size() : 0;
+ 	int naccs = g.loop ? (int)g.loop->accs.size() : 0;
+
+	int header[3] = {nvecs, naccs, 0};
+	header[2] = (int)(3 * sizeof(int) + (size_t)nvecs * sizeof(VecMeta));
+	int bcast_meta_bytes = header[2];
+	std::vector<char> bcast_buf((size_t)bcast_meta_bytes);
+
+	std::memcpy(bcast_buf.data(), header, 3 * sizeof(int));
+
+	if (nvecs > 0) {
+
+		vmeta_.resize(nvecs);
+
+		for (int vi = 0; vi < nvecs; vi++) {
+
+			vmeta_[vi].esz = g.loop->vecs[vi]->elem_size;
+			vmeta_[vi].shared_active = (g.loop->vecs[vi]->attach_policy == MAL_ATTACH_SHARED_ACTIVE || g.loop->vecs[vi]->attach_policy == MAL_ATTACH_SHARED_ALL) ? 1 : 0;
+
+		}
+
+		std::memcpy(bcast_buf.data() + 3 * sizeof(int), vmeta_.data(), (size_t)nvecs * sizeof(VecMeta));
+
+	}
+
+	MPI_Bcast(header, 3, MPI_INT, 0, g.comm.universe);
+
+	bcast_meta_bytes = header[2];
+	bcast_buf.resize((size_t)bcast_meta_bytes);
+
+	if (bcast_meta_bytes > (int)(3 * sizeof(int))) {
+
+		MPI_Bcast(bcast_buf.data() + 3 * sizeof(int), bcast_meta_bytes - (int)(3 * sizeof(int)), MPI_BYTE, 0, g.comm.universe);
+
+	}
+
+	int n_vecs = header[0];
+	int n_accs = header[1];
+
+	if (n_vecs > 0) {
+
+		vmeta_.resize(n_vecs);
+		std::memcpy(vmeta_.data(), bcast_buf.data() + 3 * sizeof(int), (size_t)n_vecs * sizeof(VecMeta));
+
+	}
+
+	redistribute_vecs(n_vecs);
+	reduce_accs(n_accs);
+
+	if (g.comm.u_rank == 0 && !target_cuts_.empty() && total_rem_ > 0) {
+
+		char buf[4096];
+		int pos = 0;
+		pos += snprintf(buf + pos, (int)sizeof(buf) - pos, "Distribution after resize %d->%d (total=%ld iters):", old_a_size_, target_, total_rem_);
+
+		for (int k = 0; k < target_ && pos < (int)sizeof(buf) - 64; k++) {
+
+			long iters = target_cuts_[(size_t)k + 1] - target_cuts_[(size_t)k];
+			double w = k < (int)g.lb.weights.size() ? g.lb.weights[(size_t)k] : 1.0 / target_;
+			pos += snprintf(buf + pos, (int)sizeof(buf) - pos, "\n R%-2d: %6ld iters weight=%.4f", k, iters, w);
+
+		}
+
+		MAL_LOG_L(MAL_LOG_DEBUG, "RESIZE", "%s", buf);
+
+	}
+
+	const double prepare_elapsed = MPI_Wtime() - t0;
+	g.timing.resize_prepare += prepare_elapsed;
+	MAL_LOG_L(MAL_LOG_DEBUG, "RESIZE", "Prepare phase done target=%d in %.4f s", target_, prepare_elapsed);
 
 }
 
 void Resizer::commit_phase() {
 
-	g.sync.wait_for_compute();
+	{
+		const double t_wfc = MPI_Wtime();
+		g.sync.wait_for_compute();
+		g.timing.wait_for_compute += MPI_Wtime() - t_wfc;
+	}
 
 	MAL_LOG_L(MAL_LOG_DEBUG, "RESIZE", "Commit phase start target=%d (current=%d)", target_, g.comm.a_size);
 
 	double t0 = MPI_Wtime();
-	const bool same_size_rebalance = (target_ == g.comm.a_size);
+
+	const bool same_size_rebalance = (target_ == old_a_size_);
 
 	if (!same_size_rebalance) {
 
@@ -2026,7 +1808,11 @@ void Resizer::commit_phase() {
 
 	const double commit_elapsed = MPI_Wtime() - t0;
 	const double epoch_secs = std::max(kEpsElapsed, g.cfg.epoch_ms.load() / 1000.0);
-	const int adaptive_cooldown = std::max(0, (int)std::ceil(commit_elapsed / epoch_secs));
+	const bool fast_resp = g.cfg.fast_response.load(std::memory_order_relaxed);
+
+	const int adaptive_cooldown = fast_resp ? 0 : std::max(0, (int)std::ceil(commit_elapsed / epoch_secs));
+	const int min_cooldown = fast_resp ? 0 : kMinResizeCooldownEpochs;
+	const int base_resize_cooldown = std::max(adaptive_cooldown, min_cooldown);
 
 	if (same_size_rebalance) {
 
@@ -2036,35 +1822,23 @@ void Resizer::commit_phase() {
 
 	} else {
 
-		if (old_a_size_ > 0 && target_ > 0 && g.lb.auto_thr_ewma > kEpsWeight) {
+		const bool is_oscillation = (g.lb.prev_resize_to > 0 && target_ == g.lb.prev_resize_from && old_a_size_ == g.lb.prev_resize_to);
 
-			g.lb.auto_thr_ewma *= (double)target_ / (double)old_a_size_;
+		g.lb.prev_resize_from = old_a_size_;
+		g.lb.prev_resize_to = target_;
 
-		}
+		g.lb.resize_cooldown = (is_oscillation && !fast_resp) ? std::max(base_resize_cooldown * 2, 4) : base_resize_cooldown;
 
-		MPI_Bcast(&g.lb.auto_thr_ewma, 1, MPI_DOUBLE, 0, g.comm.universe);
-
-		g.lb.resize_cooldown = adaptive_cooldown;
-
-		MAL_LOG_L(MAL_LOG_DEBUG, "RESIZE", "Resize %d to %d done in %.4f s (thr_ewma=%.1f iters/s synced, cooldown=%d)", old_a_size_, target_, commit_elapsed, g.lb.auto_thr_ewma, g.lb.resize_cooldown);
+		MAL_LOG_L(MAL_LOG_DEBUG, "RESIZE", "Resize %d->%d done in %.4f s (thr_1=%.1f iters/s, cooldown=%d%s)", old_a_size_, target_, commit_elapsed, g.lb.thr_single_proc, g.lb.resize_cooldown, is_oscillation ? ", oscillation" : "");
 
 	}
 
-}
-
-ResizeDecisionContext make_resize_decision_context() {
-
-	ResizeDecisionContext ctx;
-
-	ctx.universe_size = g.comm.u_size;
-	ctx.active_size = g.comm.a_size;
-	ctx.compute_epoch = g.sync.compute_epoch.load(std::memory_order_acquire);
-
- 	return ctx;
+	g.timing.resize_commit += commit_elapsed;
+	g.timing.resize_count++;
 
 }
 
-ResizeDecision decide_resize_fixed_sequence(const ResizeDecisionContext& ctx) {
+ResizeDecision decide_resize_fixed_sequence() {
 
 	ResizeDecision out;
 
@@ -2084,7 +1858,7 @@ ResizeDecision decide_resize_fixed_sequence(const ResizeDecisionContext& ctx) {
 
 	int target = g.cfg.sequence[seq_idx];
 
-	if (target <= 0 || target > ctx.universe_size || target == ctx.active_size) {
+	if (target <= 0 || target > g.comm.u_size || target == g.comm.a_size) {
 
 		return out;
 
@@ -2097,20 +1871,18 @@ ResizeDecision decide_resize_fixed_sequence(const ResizeDecisionContext& ctx) {
 
 }
 
-ResizeDecision decide_resize_auto(const ResizeDecisionContext& ctx) {
+ResizeDecision decide_resize_auto(const EpochMetrics& m) {
 
 	ResizeDecision out;
 
-	if (!g.cfg.enabled.load(std::memory_order_relaxed)) {
+	if (!g.cfg.enabled.load(std::memory_order_relaxed)) return out;
 
+	if (m.global_remaining < kEpsDone || m.active_n <= 0) {
+
+		out.done = true;
 		return out;
 
 	}
-
-	AutoResizeMetrics m = gather_auto_resize_metrics();
-	maybe_report_realized_benefit(m);
-
-	if (g.lb.same_size_rebalance_cooldown > 0) g.lb.same_size_rebalance_cooldown--;
 
 	if (g.lb.resize_cooldown > 0) {
 
@@ -2120,268 +1892,270 @@ ResizeDecision decide_resize_auto(const ResizeDecisionContext& ctx) {
 
 	}
 
-	if (m.global_remaining < kEpsDone || m.active_n <= 0) {
+	if (g.lb.same_size_rebalance_cooldown > 0) g.lb.same_size_rebalance_cooldown--;
 
-		g.sync.stop.store(true, std::memory_order_release);
-		g.sync.notify();
+	const int U = g.comm.u_size;
 
-		return out;
+	if (U == 1) return out;
 
-	}
+	using Phase = MalState::LoadBalance::Phase;
+	const double threshold = get_efficiency_threshold();
 
-	if (m.global_throughput < kEpsThroughput) {
+	auto compute_efficiency = [&]() -> double {
 
-		return out;
+		const double thr_1 = g.lb.thr_single_proc;
 
-	}
+		if (thr_1 <= kEpsThroughput || m.global_thr <= kEpsThroughput || m.active_n <= 0) {
 
-	const int U = ctx.universe_size;
-	const double bw = (g.lb.auto_bw_est_bps > kEpsWeight) ? g.lb.auto_bw_est_bps : 0.0;
-	const double epoch_secs = g.cfg.epoch_ms.load() / 1000.0;
-	const double base_sync = std::max(std::max(0.0, g.lb.auto_alpha_est_sec + g.lb.sync_wait_est_sec), epoch_secs * g.cfg.auto_sync_overhead_frac);
-
-	const auto& w = g.lb.weights;
-	const bool active_weights_ok = ((int)w.size() >= m.active_n);
-	double sum_w_active = active_weights_ok ? 0.0 : ((double)m.active_n / (double)U);
-
-	if (active_weights_ok) {
-
-		for (int k = 0; k < m.active_n; k++) {
-
-			sum_w_active += w[k];
+			return -1.0;
 
 		}
 
-	}
+		const double speedup = m.global_thr / thr_1;
+		return speedup / (double)m.active_n;
 
-	double T_current = m.global_remaining / m.global_throughput;
+	};
 
-	if (active_weights_ok && sum_w_active > kEpsThroughput && m.global_throughput > kEpsWeight) {
+	auto log_probe = [&](const char* tag, int probe_n, double eff) {
 
-		for (int k = 0; k < m.active_n; k++) {
+		if (g.comm.u_rank == 0) {
 
-			const double speed_k = m.global_throughput * w[k] / sum_w_active;
+			MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "bs-%s probe=%d active=%d thr=%.1f thr_1=%.1f speedup=%.2f eff=%.3f threshold=%.2f [lo=%d hi=%d]", tag, probe_n, m.active_n, m.global_thr, g.lb.thr_single_proc, (g.lb.thr_single_proc > kEpsThroughput ? m.global_thr / g.lb.thr_single_proc : 0.0), eff, threshold, g.lb.bs_lo, g.lb.bs_hi);
 
-			if (speed_k > kEpsWeight) {
+		}
 
-				T_current = std::max(T_current, (double)m.all_local_rem[(size_t)k] / speed_k);
+	};
+
+	switch (g.lb.bs_phase) {
+
+	case Phase::IDLE:
+
+		if (g.lb.thr_single_proc <= kEpsThroughput) {
+
+			g.lb.bs_phase = Phase::NEEDS_BASELINE;
+			MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "bs: no baseline, going to N=1");
+
+			if (m.active_n != 1) {
+
+				out.should_resize = true;
+				out.target_active_size = 1;
 
 			}
 
-		}
-
-	}
-
-	const double mem_bound = m.mem_bound_fresh;
-	const double ipc_peak = std::max({kEpsWeight, g.lb.ipc_peak_ref, g.lb.global_ipc_ewma});
-	const double energy_mix = energy_mix_from_metrics(m.mem_bound_fresh, m.global_throughput_inst, m.global_energy_eff_mass, g.lb.global_ipc_ewma, ipc_peak);
-	const double ipc_total_stall = (g.lb.global_ipc_ewma > kEpsWeight) ? std::clamp(1.0 - g.lb.global_ipc_ewma / ipc_peak, 0.0, 1.0) : 0.0;
-	const double non_llc_stall = std::max(0.0, ipc_total_stall - mem_bound);
-	const int denom = std::max(1, m.active_n);
-	std::vector<double> rank_weight_fill((size_t)std::max(0, U), 1.0 / (double)denom);
-
-	if (active_weights_ok) {
-
-		for (int i = 0; i < U; i++) {
-
-			rank_weight_fill[(size_t)i] = (i < (int)w.size()) ? w[(size_t)i] : (1.0 / (double)denom);
+			return out;
 
 		}
 
-	}
+		g.lb.bs_lo = 1;
+		g.lb.bs_hi = U;
+		g.lb.bs_phase = Phase::EXPLORE_MAX;
 
-	std::vector<double> rank_weight_prefix((size_t)std::max(0, U) + 1, 0.0);
+		MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "bs: baseline thr_1=%.1f, exploring N=%d", g.lb.thr_single_proc, U);
 
-	for (int i = 0; i < U; i++) {
+		if (m.active_n != U) {
 
-		rank_weight_prefix[(size_t)i + 1] = rank_weight_prefix[(size_t)i] + rank_weight_fill[(size_t)i];
-
-	}
-
-	std::vector<int> candidate_targets;
-
-	if (U <= 16) {
-
-		candidate_targets.reserve((size_t)U);
-
-		for (int target_n = 1; target_n <= U; target_n++) {
-
-			candidate_targets.push_back(target_n);
+			out.should_resize = true;
+			out.target_active_size = U;
 
 		}
 
-	} else {
-
-		std::vector<char> seen((size_t)U + 1, 0);
-		candidate_targets.reserve((size_t)std::min(U, 16));
-
-		push_candidate_target(candidate_targets, seen, 1);
-		push_candidate_target(candidate_targets, seen, U);
-		push_candidate_target(candidate_targets, seen, m.active_n);
-
-		const int radius = std::max(0, g.cfg.auto_candidate_radius);
-
-		for (int d = 1; d <= radius; d++) {
-
-			push_candidate_target(candidate_targets, seen, m.active_n - d);
-			push_candidate_target(candidate_targets, seen, m.active_n + d);
-
-		}
-
-		for (int p2 = 1; p2 <= U; p2 <<= 1) {
-
-			push_candidate_target(candidate_targets, seen, p2);
-
-			if (p2 > U / 2) {
-
-				break;
-
-			}
-
-		}
-
-		const int stride = std::max(1, g.cfg.auto_candidate_stride);
-
-		if (stride > 1) {
-
-			for (int target_n = stride; target_n < U; target_n += stride) {
-
-				push_candidate_target(candidate_targets, seen, target_n);
-
-			}
-
-		}
-
-		std::sort(candidate_targets.begin(), candidate_targets.end());
-
-	}
-
-	std::vector<ResizeCandidateEval> all_candidates;
-	all_candidates.reserve(candidate_targets.size());
-
-	for (int target_n : candidate_targets) {
-
-		all_candidates.push_back(evaluate_resize_candidate(m, m.active_n, target_n, rank_weight_fill, rank_weight_prefix, active_weights_ok, sum_w_active, m.global_throughput, m.global_remaining, m.max_data_bytes, bw, base_sync, T_current, mem_bound, non_llc_stall, energy_mix));
-
-	}
-
-	log_top_resize_candidates(all_candidates, m.active_n);
-
-	ResizeCandidateEval selected;
-	selected.score = 0.0;
-
-	for (const auto& candidate : all_candidates) {
-
-		if (!candidate.worthwhile || candidate.score <= selected.score) {
-
-			continue;
-
-		}
-
-		selected = candidate;
-
-	}
-
-	const double transfer_pressure = std::clamp((base_sync + g.lb.sync_wait_est_sec) / (T_current + base_sync + g.lb.sync_wait_est_sec + kEpsWeight), 0.0, 1.0);
-	const double thr_noise = std::clamp(std::fabs(m.global_throughput_inst - m.global_throughput) / std::max(m.global_throughput, kEpsWeight), 0.0, 1.0);
-	const double trust_guard_cap = std::max(1.0, g.cfg.auto_trust_guard_cap);
-	const double raw_trust_guard = (g.lb.benefit_trust > kEpsWeight) ? (1.0 / g.lb.benefit_trust) : trust_guard_cap;
-	const double trust_guard = std::clamp(raw_trust_guard, 0.0, trust_guard_cap);
-	const double min_rel_gain_model = (base_sync + g.lb.auto_alpha_est_sec) / (T_current + base_sync + g.lb.auto_alpha_est_sec + kEpsWeight) * trust_guard;
-	const double rel_gain_floor = std::clamp(g.cfg.auto_min_rel_gain_floor, 0.0, 1.0);
-	const double rel_gain_cap = std::clamp(std::max(rel_gain_floor, g.cfg.auto_min_rel_gain_cap), rel_gain_floor, 1.0);
-	const double min_rel_gain = std::clamp(min_rel_gain_model, rel_gain_floor, rel_gain_cap);
-	const double gain_margin = 1.0 + transfer_pressure + thr_noise;
-
-	const ResizeCandidateEval* rebalance = nullptr;
-
-	for (const auto& candidate : all_candidates) {
-
-		if (candidate.target_n == m.active_n) {
-
-			rebalance = &candidate;
-			break;
-
-		}
-
-	}
-
-	const bool rebalance_passes_rel_gain = rebalance && rebalance->worthwhile && rebalance->rel_gain >= min_rel_gain;
-
-	if (selected.worthwhile && selected.target_n != m.active_n && rebalance_passes_rel_gain) {
-
-		const double required_score = rebalance->score * gain_margin;
-
-		if (selected.score < required_score) {
-
-			if (g.comm.u_rank == 0) {
-
-				MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Scale candidate downgraded to same-size rebalance (scale_score=%.4f < rebalance_score=%.4f * margin=%.2f)", selected.score, rebalance->score, gain_margin);
-
-			}
-			selected = *rebalance;
-
-		}
-
-	}
-
-	if (!selected.worthwhile || selected.score <= 0.0 || selected.target_n <= 0) {
-
-		if (g.comm.u_rank == 0) {
-
-			MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "No resize candidate clears the score bar: active=%d rem=%.0f T=%.3fs mem=%.2f ipc=%.2f", m.active_n, m.global_remaining, T_current, mem_bound, g.lb.global_ipc_ewma);
-
-		}
 		return out;
 
-	}
+	case Phase::NEEDS_BASELINE:
 
-	const bool selected_passes_rel_gain = selected.worthwhile && selected.rel_gain >= min_rel_gain;
 
-	if (!selected_passes_rel_gain) {
+		if (g.lb.bs_baseline_count < kMinBaselineEpochs || g.lb.thr_single_proc <= kEpsThroughput) {
 
-		if (g.comm.u_rank == 0) {
-
-			MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Candidate rejected by min rel gain: target=%d rel=%.2f%% < min=%.2f%%", selected.target_n, selected.rel_gain * 100.0, min_rel_gain * 100.0);
+			MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "bs: baseline %d/%d epochs thr_1=%.1f (waiting)", g.lb.bs_baseline_count, kMinBaselineEpochs, g.lb.thr_single_proc);
+			return out;
 
 		}
+
+
+		g.lb.bs_lo = 1;
+		g.lb.bs_hi = U;
+		g.lb.bs_baseline_count = 0;
+		g.lb.bs_phase = Phase::EXPLORE_MAX;
+
+		MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "bs: baseline ready thr_1=%.1f (%d epochs), going to N=%d", g.lb.thr_single_proc, kMinBaselineEpochs, U);
+
+		out.should_resize = true;
+		out.target_active_size = U;
+
 		return out;
 
-	}
+	case Phase::EXPLORE_MAX:
 
-	out.should_resize = true;
-	out.target_active_size = selected.target_n;
-	out.post_eval_valid = true;
-	out.post_eval_from_n = m.active_n;
-	out.post_eval_to_n = selected.target_n;
-	out.post_eval_decision_time = MPI_Wtime();
-	out.post_eval_pred_net_gain = selected.net_gain;
-	out.post_eval_pred_rel_gain = selected.rel_gain;
-	out.post_eval_pred_score = selected.score;
-	out.post_eval_baseline_thr = m.global_throughput_inst;
-	out.post_eval_baseline_remaining = m.global_remaining;
+		if (m.active_n != U) {
 
-	if (selected.target_n == m.active_n) {
+			out.should_resize = true;
+			out.target_active_size = U;
 
-		if (g.comm.u_rank == 0) {
-
-			MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Same-size rebalance: active=%d T_curr=%.3fs T_new=%.3fs gain=%.3fs cost=%.3fs score=%.3fs rel=%.2f%%", m.active_n, T_current, selected.T_next, selected.net_gain, selected.transfer_cost, selected.score, selected.rel_gain * 100.0);
+			return out;
 
 		}
 
-	} else if (selected.target_n < m.active_n) {
+		{
 
-		if (g.comm.u_rank == 0) {
+			const double eff = compute_efficiency();
+			if (eff < 0.0) return out;
 
-			MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Scale down: rem=%.0f T_curr=%.3fs T_new=%.3fs gain=%.3fs cost=%.3fs score=%.3fs to target=%d", m.global_remaining, T_current, selected.T_next, selected.net_gain, selected.transfer_cost, selected.score, selected.target_n);
+			log_probe("max", U, eff);
+
+			if (eff >= threshold) {
+
+				MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "bs: N=%d meets threshold (eff=%.3f >= %.2f), entering PROBING", U, eff, threshold);
+				g.lb.bs_phase = Phase::PROBING;
+
+				return out;
+
+			}
+
+			g.lb.bs_lo = 1;
+			g.lb.bs_hi = U;
+			const int probe = (g.lb.bs_lo + g.lb.bs_hi) / 2;
+			g.lb.bs_phase = Phase::SEARCHING;
+			MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "bs: N=%d below threshold (eff=%.3f < %.2f), searching [%d,%d] probe=%d", U, eff, threshold, g.lb.bs_lo, g.lb.bs_hi, probe);
+
+			out.should_resize = true;
+			out.target_active_size = probe;
+
+			return out;
 
 		}
 
-	} else {
+	case Phase::SEARCHING:
+		{
 
-		if (g.comm.u_rank == 0) {
+			const double eff = compute_efficiency();
 
-			MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Scale up: rem=%.0f T_curr=%.3fs T_new=%.3fs gain=%.3fs cost=%.3fs score=%.3fs to target=%d", m.global_remaining, T_current, selected.T_next, selected.net_gain, selected.transfer_cost, selected.score, selected.target_n);
+			if (eff < 0.0) return out;
+
+			log_probe("search", m.active_n, eff);
+
+			if (eff >= threshold) {
+
+				g.lb.bs_lo = m.active_n;
+
+			} else {
+
+				g.lb.bs_hi = m.active_n;
+
+			}
+
+			if (g.lb.bs_hi - g.lb.bs_lo <= 1) {
+
+				const int best = g.lb.bs_lo;
+				g.lb.bs_phase = Phase::PROBING;
+
+				MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "bs: converged, PROBING from N=%d", best);
+
+				if (best != m.active_n) {
+
+					out.should_resize = true;
+					out.target_active_size = best;
+
+				}
+
+				return out;
+
+			}
+
+			const int probe = (g.lb.bs_lo + g.lb.bs_hi) / 2;
+
+			MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "bs: [%d,%d] next probe=%d", g.lb.bs_lo, g.lb.bs_hi, probe);
+
+			out.should_resize = true;
+			out.target_active_size = probe;
+
+			return out;
+
+		}
+
+	case Phase::PROBING:
+		{
+
+			const double eff = compute_efficiency();
+			if (eff < 0.0) {
+
+				return out;
+
+			}
+
+			log_probe("probe", m.active_n, eff);
+
+			if (eff >= threshold) {
+
+				if (m.active_n > g.lb.bs_lo) {
+
+					g.lb.bs_lo = m.active_n;
+					MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "probe: improved to bs_lo=%d", g.lb.bs_lo);
+
+				}
+
+				if (m.active_n < U) {
+
+					out.should_resize = true;
+					out.target_active_size = m.active_n + 1;
+
+					return out;
+
+				}
+
+				const bool lb_enabled = g.cfg.load_balancing_enabled.load(std::memory_order_relaxed);
+				if (lb_enabled && g.lb.same_size_rebalance_cooldown == 0 && m.active_n > 1) {
+
+					const double ideal_w = 1.0 / (double)m.active_n;
+					double max_w = 0.0;
+
+					for (int k = 0; k < m.active_n; k++) {
+
+						if (k < (int)g.lb.weights.size()) {
+
+							max_w = std::max(max_w, g.lb.weights[(size_t)k]);
+
+						}
+
+					}
+
+					if (max_w > 1.3 * ideal_w) {
+
+						out.should_resize = true;
+						out.target_active_size = m.active_n;
+
+					}
+
+				}
+
+				return out;
+			}
+
+			if (m.active_n > g.lb.bs_lo) {
+
+				g.lb.bs_hi = m.active_n;
+				MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "probe: N=%d failed (eff=%.3f < %.2f), returning to bs_lo=%d", m.active_n, eff, threshold, g.lb.bs_lo);
+				out.should_resize = true;
+				out.target_active_size = g.lb.bs_lo;
+
+			} else {
+
+				g.lb.bs_hi = m.active_n;
+				g.lb.bs_lo = std::max(1, m.active_n / 2);
+				g.lb.bs_phase = Phase::SEARCHING;
+				const int probe = (g.lb.bs_lo + g.lb.bs_hi) / 2;
+
+				MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "probe: home N=%d degraded (eff=%.3f < %.2f), re-searching [%d,%d] probe=%d", m.active_n, eff, threshold, g.lb.bs_lo, g.lb.bs_hi, probe);
+
+				if (probe != m.active_n) {
+
+					out.should_resize = true;
+					out.target_active_size = probe;
+
+				}
+
+			}
+
+			return out;
 
 		}
 
@@ -2391,25 +2165,35 @@ ResizeDecision decide_resize_auto(const ResizeDecisionContext& ctx) {
 
 }
 
-ResizeDecision run_local_resize_decision(ResizeDecisionContext& ctx) {
+ResizeDecision run_local_resize_decision(const EpochMetrics& m) {
 
 	ResizeDecision decision;
+
+	if (m.global_remaining < kEpsDone || m.active_n <= 0) {
+
+		decision.done = true;
+		return decision;
+
+	}
 
 	switch (g.cfg.resize_policy) {
 
 		case MAL_RESIZE_POLICY_AUTO:
 		case MAL_RESIZE_POLICY_THROUGHPUT:
-		case MAL_RESIZE_POLICY_ENERGY:
+		case MAL_RESIZE_POLICY_EFFICIENCY:
 		case MAL_RESIZE_POLICY_COST:
-			decision = decide_resize_auto(ctx);
+
+			decision = decide_resize_auto(m);
 			break;
 
 		case MAL_RESIZE_POLICY_FIXED_SEQUENCE:
-			decision = decide_resize_fixed_sequence(ctx);
+
+			decision = decide_resize_fixed_sequence();
 			break;
 
 		default:
-			decision = decide_resize_auto(ctx);
+
+			decision = decide_resize_auto(m);
 			break;
 
 	}
@@ -2417,7 +2201,6 @@ ResizeDecision run_local_resize_decision(ResizeDecisionContext& ctx) {
 	if (!decision.should_resize) {
 
 		decision.target_active_size = -1;
-		decision.post_eval_valid = false;
 		return decision;
 
 	}
@@ -2427,7 +2210,6 @@ ResizeDecision run_local_resize_decision(ResizeDecisionContext& ctx) {
 		MAL_LOG_L(MAL_LOG_WARN, "EPOCH", "Decision returned invalid target=%d (valid range 1..%d)", decision.target_active_size, g.comm.u_size);
 		decision.should_resize = false;
 		decision.target_active_size = -1;
-		decision.post_eval_valid = false;
 
 	}
 
@@ -2441,63 +2223,89 @@ struct ResizeConsensus {
 	bool should_resize{false};
 	int target{-1};
 	int active_size{-1};
-	unsigned long long decision_epoch{0};
 	unsigned long long local_decision_epoch{0};
-	ResizeDecision local_decision{};
 
 };
 
 ResizeConsensus unanimous_resize_decision() {
 
+	const double t_decision_start = MPI_Wtime();
+
 	ResizeConsensus out;
-	ResizeDecisionContext local_ctx = make_resize_decision_context();
-	const bool is_active = (g.comm.active != MPI_COMM_NULL);
-	ResizeDecision local_decision = is_active ? run_local_resize_decision(local_ctx) : ResizeDecision{};
-	out.local_decision = local_decision;
 
-	const unsigned long long post_decision_epoch = g.sync.compute_epoch.load(std::memory_order_acquire);
-	out.local_decision_epoch = std::max(local_ctx.compute_epoch, post_decision_epoch);
-	local_ctx.compute_epoch = out.local_decision_epoch;
+	EpochMetrics m = gather_epoch_metrics();
 
-	if (g.comm.u_rank == 0) {
+	if (!m.any_has_loop) {
 
-		MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Distributed resize evaluation: active=%d universe=%d epoch=%llu", local_ctx.active_size, local_ctx.universe_size, local_ctx.compute_epoch);
+		g.timing.epoch_decision += MPI_Wtime() - t_decision_start;
+		g.timing.epoch_decision_count++;
+		return out;
 
 	}
 
-	const long long any_active_flag = is_active ? 1LL : 0LL;
+	const unsigned long long pre_decision_epoch = g.sync.compute_epoch.load(std::memory_order_acquire);
+	const bool is_active = (g.comm.active != MPI_COMM_NULL);
+	ResizeDecision local_decision = is_active ? run_local_resize_decision(m) : ResizeDecision{};
+	const unsigned long long post_decision_epoch = g.sync.compute_epoch.load(std::memory_order_acquire);
+	const unsigned long long decision_epoch = std::max(pre_decision_epoch, post_decision_epoch);
+	out.local_decision_epoch = decision_epoch;
+
+	if (g.comm.u_rank == 0) {
+
+		MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Distributed resize evaluation: active=%d universe=%d epoch=%llu", g.comm.a_size, g.comm.u_size, decision_epoch);
+
+	}
+
 	const long long local_should = local_decision.should_resize ? 1LL : 0LL;
 	const long long local_target = local_decision.should_resize ? (long long)local_decision.target_active_size : -1LL;
-	const long long local_active = (long long)local_ctx.active_size;
-	const long long local_epoch = (long long)local_ctx.compute_epoch;
+	const long long local_active = (long long)g.comm.a_size;
+	const long long local_finalize = g.sync.finalize_requested.load(std::memory_order_acquire) ? 1LL : 0LL;
+	const long long local_done = local_decision.done ? 1LL : 0LL;
+	const long long any_active_flag = is_active ? 1LL : 0LL;
 
 	const long long send_should = is_active ? local_should : 0LL;
 	const long long send_neg_should = is_active ? -local_should : LLONG_MIN / 2;
 	const long long send_target = is_active ? local_target : -1LL;
 	const long long send_neg_target = is_active ? -local_target : LLONG_MIN / 2;
 
-	long long reduce_in[7] = { send_should, send_target, send_neg_should, send_neg_target, local_active, local_epoch, any_active_flag};
-	long long reduce_out[7] = {0, 0, 0, 0, 0, 0, 0};
+	long long reduce_in[8] = {send_should, send_target, send_neg_should, send_neg_target, local_active, local_finalize, local_done, any_active_flag};
+	long long reduce_out[8] = {};
 
-	MPI_Allreduce(reduce_in, reduce_out, 7, MPI_LONG_LONG, MPI_MAX, g.comm.universe);
+	MPI_Allreduce(reduce_in, reduce_out, 8, MPI_LONG_LONG, MPI_MAX, g.comm.universe);
 
 	const long long max_should = reduce_out[0];
 	const long long max_target = reduce_out[1];
 	const long long min_should = -reduce_out[2];
 	const long long min_target = -reduce_out[3];
-	const bool any_active_voted = (reduce_out[6] != 0);
+	const long long any_finalize = reduce_out[5];
+	const long long any_done = reduce_out[6];
+	const bool any_active_voted = (reduce_out[7] != 0);
+
+	if (any_finalize || any_done) {
+
+		g.sync.stop.store(true, std::memory_order_release);
+		g.sync.notify();
+		out.unanimous = true;
+		out.should_resize = false;
+		out.target = -1;
+		out.active_size = (int)reduce_out[4];
+		return out;
+
+	}
 
 	out.unanimous = any_active_voted && (min_should == max_should) && (min_should == 0 || min_target == max_target);
 	out.should_resize = out.unanimous && min_should != 0;
 	out.target = out.should_resize ? (int)min_target : -1;
 	out.active_size = (int)reduce_out[4];
-	out.decision_epoch = (unsigned long long)reduce_out[5];
 
 	if (g.comm.u_rank == 0) {
 
 		MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Consensus from distributed eval: unanimous=%d should=%d target=%d", (int)out.unanimous, (int)out.should_resize, out.target);
 
 	}
+
+	g.timing.epoch_decision += MPI_Wtime() - t_decision_start;
+	g.timing.epoch_decision_count++;
 
 	return out;
 
@@ -2528,9 +2336,22 @@ void advance_default_sequence_after_commit() {
 
 }
 
+static bool prepare_with_consistent_snapshot(Resizer& resizer) {
+
+	if (g.sync.stop.load(std::memory_order_acquire)) {
+
+		return false;
+
+	}
+
+	resizer.prepare_phase();
+	return true;
+
+}
+
 bool prepare_resize_if_needed() {
 
-	if (!g.cfg.enabled.load(std::memory_order_relaxed)) {
+	if (!g.cfg.malleability_enabled.load(std::memory_order_relaxed)) {
 
 		return false;
 
@@ -2555,7 +2376,7 @@ bool prepare_resize_if_needed() {
 	}
 
 	ResizeConsensus consensus = unanimous_resize_decision();
-	MAL_LOG_L(MAL_LOG_DEBUG, "EPOCH", "Consensus: should=%d target=%d active=%d epoch=%llu", (int)consensus.should_resize, consensus.target, consensus.active_size, consensus.decision_epoch);
+	MAL_LOG_L(MAL_LOG_DEBUG, "EPOCH", "Consensus: should=%d target=%d active=%d", (int)consensus.should_resize, consensus.target, consensus.active_size);
 
 	const bool seq_policy = (g.cfg.resize_policy == MAL_RESIZE_POLICY_FIXED_SEQUENCE);
 
@@ -2571,9 +2392,7 @@ bool prepare_resize_if_needed() {
 	if (seq_policy && consensus.unanimous && !consensus.should_resize) {
 
 		size_t seq_idx = g.cfg.seq_idx.load(std::memory_order_relaxed);
-		bool skipped = g.cfg.enabled.load(std::memory_order_relaxed) &&
-			seq_idx < g.cfg.sequence.size() &&
-			g.cfg.sequence[seq_idx] == consensus.active_size;
+		bool skipped = g.cfg.enabled.load(std::memory_order_relaxed) && seq_idx < g.cfg.sequence.size() && g.cfg.sequence[seq_idx] == consensus.active_size;
 
 		if (skipped) {
 
@@ -2594,7 +2413,12 @@ bool prepare_resize_if_needed() {
 	}
 
 	auto prepared = std::make_unique<Resizer>(consensus.target);
-	prepared->prepare_phase();
+
+	if (!prepare_with_consistent_snapshot(*prepared)) {
+
+		return false;
+
+	}
 
 	{
 
@@ -2602,29 +2426,20 @@ bool prepare_resize_if_needed() {
 
 		if (g.prepared_resize.ready()) {
 
+			g.sync.resize_pending.store(false, std::memory_order_release);
+			g.sync.notify();
 			return false;
 
 		}
 
 		g.prepared_resize.target = consensus.target;
-		g.prepared_resize.decision_epoch = consensus.decision_epoch;
 		g.prepared_resize.local_decision_epoch = consensus.local_decision_epoch;
-		g.prepared_resize.post_eval_valid = consensus.local_decision.post_eval_valid;
-		g.prepared_resize.post_eval_from_n = consensus.local_decision.post_eval_from_n;
-		g.prepared_resize.post_eval_to_n = consensus.local_decision.post_eval_to_n;
-		g.prepared_resize.post_eval_decision_time = consensus.local_decision.post_eval_decision_time;
-		g.prepared_resize.post_eval_pred_net_gain = consensus.local_decision.post_eval_pred_net_gain;
-		g.prepared_resize.post_eval_pred_rel_gain = consensus.local_decision.post_eval_pred_rel_gain;
-		g.prepared_resize.post_eval_pred_score = consensus.local_decision.post_eval_pred_score;
-		g.prepared_resize.post_eval_baseline_thr = consensus.local_decision.post_eval_baseline_thr;
-		g.prepared_resize.post_eval_baseline_remaining = consensus.local_decision.post_eval_baseline_remaining;
-
 		g.prepared_resize.work = std::move(prepared);
 		g.prepared_resize_ready.store(true, std::memory_order_release);
 
 	}
 
-	MAL_LOG_L(MAL_LOG_DEBUG, "EPOCH", "Prepared resize candidate target=%d (epoch=%llu)", consensus.target, consensus.decision_epoch);
+	MAL_LOG_L(MAL_LOG_DEBUG, "EPOCH", "Prepared resize candidate target=%d", consensus.target);
 
 	return true;
 
@@ -2648,15 +2463,6 @@ bool commit_prepared_resize_if_ready() {
 
 	int prep_target = -1;
 	unsigned long long prep_local_epoch = 0;
-	bool prep_post_eval_valid = false;
-	int prep_post_eval_from_n = 0;
-	int prep_post_eval_to_n = 0;
-	double prep_post_eval_decision_time = 0.0;
-	double prep_post_eval_pred_net_gain = 0.0;
-	double prep_post_eval_pred_rel_gain = 0.0;
-	double prep_post_eval_pred_score = 0.0;
-	double prep_post_eval_baseline_thr = 0.0;
-	double prep_post_eval_baseline_remaining = 0.0;
 	std::unique_ptr<Resizer> prepared_work;
 
 	{
@@ -2666,6 +2472,8 @@ bool commit_prepared_resize_if_ready() {
 		if (!g.prepared_resize.ready()) {
 
 			g.prepared_resize_ready.store(false, std::memory_order_release);
+			g.sync.resize_pending.store(false, std::memory_order_release);
+			g.sync.notify();
 
 			return false;
 
@@ -2673,20 +2481,9 @@ bool commit_prepared_resize_if_ready() {
 
 		prep_target = g.prepared_resize.target;
 		prep_local_epoch = g.prepared_resize.local_decision_epoch;
-		prep_post_eval_valid = g.prepared_resize.post_eval_valid;
-		prep_post_eval_from_n = g.prepared_resize.post_eval_from_n;
-		prep_post_eval_to_n = g.prepared_resize.post_eval_to_n;
-		prep_post_eval_decision_time = g.prepared_resize.post_eval_decision_time;
-		prep_post_eval_pred_net_gain = g.prepared_resize.post_eval_pred_net_gain;
-		prep_post_eval_pred_rel_gain = g.prepared_resize.post_eval_pred_rel_gain;
-		prep_post_eval_pred_score = g.prepared_resize.post_eval_pred_score;
-		prep_post_eval_baseline_thr = g.prepared_resize.post_eval_baseline_thr;
-		prep_post_eval_baseline_remaining = g.prepared_resize.post_eval_baseline_remaining;
 		prepared_work = std::move(g.prepared_resize.work);
 		g.prepared_resize.target = -1;
-		g.prepared_resize.decision_epoch = 0;
 		g.prepared_resize.local_decision_epoch = 0;
-		g.prepared_resize.post_eval_valid = false;
 		g.prepared_resize_ready.store(false, std::memory_order_release);
 
 	}
@@ -2703,11 +2500,11 @@ bool commit_prepared_resize_if_ready() {
 
 		if (mode == MAL_EPOCH_CHANGE_USE_LAST_DECISION) {
 
-			MAL_LOG_L(MAL_LOG_DEBUG, "EPOCH", "Epoch changed; reusing prepared decision target=%d with existing data (mode=1)", prep_target);
+			MAL_LOG_L(MAL_LOG_INFO, "EPOCH", "Epoch changed (prep_epoch=%llu, current_epoch=%llu) — STALE decision, but mode=1 (USE_LAST_DECISION): reusing old decision target=%d without recalculating", prep_local_epoch, epoch_now, prep_target);
 
 		} else {
 
-			MAL_LOG_L(MAL_LOG_DEBUG, "EPOCH", "Epoch changed; discarding prepared data and recalculating (mode=0)");
+			MAL_LOG_L(MAL_LOG_INFO, "EPOCH", "Epoch changed (prep_epoch=%llu, current_epoch=%llu) — STALE decision, mode=0 (RECALCULATE): discarding old target=%d and recalculating", prep_local_epoch, epoch_now, prep_target);
 
 			prepared_work.reset();
 
@@ -2715,125 +2512,40 @@ bool commit_prepared_resize_if_ready() {
 
 			if (!refreshed.unanimous || !refreshed.should_resize) {
 
-				MAL_LOG_L(MAL_LOG_DEBUG, "EPOCH", "Recalculated decision: no valid resize needed (old_target=%d)", prep_target);
+				MAL_LOG_L(MAL_LOG_INFO, "EPOCH", "Recalculated decision: no valid resize needed (old_target=%d) — resize aborted, releasing compute", prep_target);
+				g.sync.resize_pending.store(false, std::memory_order_release);
+				g.sync.notify();
 				return false;
 
 			}
 
+			MAL_LOG_L(MAL_LOG_INFO, "EPOCH", "Recalculated decision: new_target=%d (old_target=%d)", refreshed.target, prep_target);
+
 			prepared_work = std::make_unique<Resizer>(refreshed.target);
-			prepared_work->prepare_phase();
 
-			prep_target = refreshed.target;
-			prep_local_epoch = refreshed.local_decision_epoch;
-			prep_post_eval_valid = refreshed.local_decision.post_eval_valid;
-			prep_post_eval_from_n = refreshed.local_decision.post_eval_from_n;
-			prep_post_eval_to_n = refreshed.local_decision.post_eval_to_n;
-			prep_post_eval_decision_time = refreshed.local_decision.post_eval_decision_time;
-			prep_post_eval_pred_net_gain = refreshed.local_decision.post_eval_pred_net_gain;
-			prep_post_eval_pred_rel_gain = refreshed.local_decision.post_eval_pred_rel_gain;
-			prep_post_eval_pred_score = refreshed.local_decision.post_eval_pred_score;
-			prep_post_eval_baseline_thr = refreshed.local_decision.post_eval_baseline_thr;
-			prep_post_eval_baseline_remaining = refreshed.local_decision.post_eval_baseline_remaining;
+			if (!prepare_with_consistent_snapshot(*prepared_work)) {
 
-		}
-
-	}
-
-	double my_data_bytes = 0.0;
-
-	if (g.loop) {
-
-		for (MalVec* v : g.loop->vecs) {
-
-			if (v && v->attach_policy == MAL_ATTACH_PARTITIONED) {
-
-				const long rem_local = std::max(0L, v->local_n - v->done_n);
-				my_data_bytes += (double)rem_local * (double)v->elem_size;
+				return false;
 
 			}
 
+			prep_target = refreshed.target;
+			prep_local_epoch = refreshed.local_decision_epoch;
+
 		}
 
+	} else {
+
+		MAL_LOG_L(MAL_LOG_INFO, "EPOCH", "Epoch unchanged (prep_epoch=%llu == current_epoch=%llu) — FRESH decision: using target=%d as-is", prep_local_epoch, epoch_now, prep_target);
+
 	}
-
-	double max_data_bytes = 0.0;
-	MPI_Allreduce(&my_data_bytes, &max_data_bytes, 1, MPI_DOUBLE, MPI_MAX, g.comm.universe);
-
-	const int old_n = std::max(1, g.comm.a_size);
-	const int new_n = std::max(1, prep_target);
-	const int denom_n = std::max(old_n, new_n);
-	const double model_moved_bytes = max_data_bytes * (double)std::abs(new_n - old_n) / (double)denom_n;
-	const double model_logp = std::log2(std::max(2.0, (double)new_n));
 
 	g.sync.resize_pending.store(true, std::memory_order_release);
 	g.sync.notify();
 
 	MAL_LOG_L(MAL_LOG_DEBUG, "EPOCH", "Committing resize target=%d", prep_target);
 
-	const double commit_t0 = MPI_Wtime();
 	prepared_work->commit_phase();
-	const double commit_elapsed_local = MPI_Wtime() - commit_t0;
-
-	g.lb.post_eval_pending = prep_post_eval_valid;
-
-	if (prep_post_eval_valid) {
-
-		g.lb.post_eval_from_n = prep_post_eval_from_n;
-		g.lb.post_eval_to_n = prep_post_eval_to_n;
-		g.lb.post_eval_decision_time = prep_post_eval_decision_time;
-		g.lb.post_eval_pred_net_gain = prep_post_eval_pred_net_gain;
-		g.lb.post_eval_pred_rel_gain = prep_post_eval_pred_rel_gain;
-		g.lb.post_eval_pred_score = prep_post_eval_pred_score;
-		g.lb.post_eval_baseline_thr = prep_post_eval_baseline_thr;
-		g.lb.post_eval_baseline_remaining = prep_post_eval_baseline_remaining;
-
-	}
-
-	double commit_elapsed = 0.0;
-	MPI_Allreduce(&commit_elapsed_local, &commit_elapsed, 1, MPI_DOUBLE, MPI_MAX, g.comm.universe);
-
-	if (model_logp > kEpsThroughput) {
-
-		const double cal_alpha = std::clamp(g.cfg.auto_calibration_alpha, kEpsElapsed, 1.0);
-		const double bw_ref = (g.lb.auto_bw_est_bps > kEpsWeight) ? g.lb.auto_bw_est_bps : g.cfg.auto_bandwidth_bps;
-		const double data_term = (bw_ref > kEpsWeight) ? (model_moved_bytes / bw_ref) : 0.0;
-
-		double alpha_sample = (commit_elapsed - data_term) / model_logp;
-		if (!std::isfinite(alpha_sample) || alpha_sample < 0.0) {
-
-			alpha_sample = 0.0;
-
-		}
-
-		g.lb.auto_alpha_est_sec = cal_alpha * alpha_sample + (1.0 - cal_alpha) * g.lb.auto_alpha_est_sec;
-
-		if (model_moved_bytes > kEpsElapsed && commit_elapsed > kEpsThroughput) {
-
-			double beta_sample = (commit_elapsed - g.lb.auto_alpha_est_sec * model_logp) / model_moved_bytes;
-
-			if (std::isfinite(beta_sample) && beta_sample > 0.0) {
-
-				const double bw_sample = 1.0 / beta_sample;
-				g.lb.auto_bw_est_bps = cal_alpha * bw_sample + (1.0 - cal_alpha) * g.lb.auto_bw_est_bps;
-
-			}
-
-		}
-
-		const double model_comm_est = g.lb.auto_alpha_est_sec * model_logp + ((g.lb.auto_bw_est_bps > kEpsWeight) ? (model_moved_bytes / g.lb.auto_bw_est_bps) : 0.0);
-		double sync_wait_sample = commit_elapsed - model_comm_est;
-
-		if (!std::isfinite(sync_wait_sample) || sync_wait_sample < 0.0) {
-
-			sync_wait_sample = 0.0;
-
-		}
-
-		g.lb.sync_wait_est_sec = cal_alpha * sync_wait_sample + (1.0 - cal_alpha) * g.lb.sync_wait_est_sec;
-
-		MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "Calibrated comm model: alpha=%.6fs bw=%.3e B/s sync_wait=%.6fs (elapsed=%.4fs moved=%.3eB logp=%.3f)", g.lb.auto_alpha_est_sec, g.lb.auto_bw_est_bps, g.lb.sync_wait_est_sec, commit_elapsed, model_moved_bytes, model_logp);
-
-	}
 
 	g.sync.resize_pending.store(false, std::memory_order_release);
 	clear_prepared_resize();
@@ -2885,7 +2597,10 @@ void progress_thread() {
 	#endif
 
 	std::vector<std::function<void()>> batch;
-	auto next_resize_check = std::chrono::steady_clock::now() + std::chrono::milliseconds(effective_epoch_interval_ms());
+	int epoch_backoff_multiplier = 1;
+	constexpr int kMaxBackoffMultiplier = 8;
+	const bool needs_initial_rampup = g.comm.a_size > 0 && g.comm.a_size < g.comm.u_size && g.cfg.resize_policy != MAL_RESIZE_POLICY_FIXED_SEQUENCE;
+	auto next_resize_check = std::chrono::steady_clock::now() + std::chrono::milliseconds(needs_initial_rampup ? 1 : effective_epoch_interval_ms());
 
 	while (!g.sync.stop.load(std::memory_order_relaxed)) {
 
@@ -2926,8 +2641,11 @@ void progress_thread() {
 			for (;;) {
 
 				const bool should_wake =
-					g.sync.stop.load(std::memory_order_acquire) ||
-					g.sync.attach_pending.load(std::memory_order_acquire) ||
+					g.sync.stop.load(std::memory_order_relaxed) ||
+					g.sync.finalize_requested.load(std::memory_order_relaxed) ||
+					g.sync.attach_pending.load(std::memory_order_relaxed) ||
+					g.sync.compute_ready.load(std::memory_order_relaxed) ||
+					g.prepared_resize_ready.load(std::memory_order_relaxed) ||
 					effective_epoch_interval_ms() != epoch_snapshot_ms;
 
 				if (should_wake) {
@@ -2967,21 +2685,57 @@ void progress_thread() {
 
 		}
 
+		const bool finalize_now = g.sync.finalize_requested.load(std::memory_order_acquire);
+		const bool compute_ready = g.sync.compute_ready.load(std::memory_order_acquire);
+		const bool prepared_ready = g.prepared_resize_ready.load(std::memory_order_acquire);
 		const auto now = std::chrono::steady_clock::now();
 
-		if (now < next_resize_check) {
+		if (!finalize_now && !compute_ready && !prepared_ready && now < next_resize_check) {
 
 			continue;
 
 		}
 
-		next_resize_check = now + std::chrono::milliseconds(epoch_ms);
+		const bool should_try_prepare = finalize_now || compute_ready || now >= next_resize_check;
 
-		prepare_resize_if_needed();
+		if (should_try_prepare) {
+
+			const bool did_prepare = prepare_resize_if_needed();
+
+			const bool fast_resp = g.cfg.fast_response.load(std::memory_order_relaxed);
+
+			if (did_prepare) {
+
+				epoch_backoff_multiplier = 1;
+
+			} else if (needs_initial_rampup && g.timing.resize_count == 0) {
+
+				epoch_backoff_multiplier = 1;
+
+			} else if (fast_resp) {
+
+				epoch_backoff_multiplier = 1;
+
+			} else if (epoch_backoff_multiplier < kMaxBackoffMultiplier) {
+
+				epoch_backoff_multiplier = std::min(epoch_backoff_multiplier * 2, kMaxBackoffMultiplier);
+
+			}
+
+			next_resize_check = now + std::chrono::milliseconds(epoch_ms * epoch_backoff_multiplier);
+
+		}
+
+		if (g.sync.stop.load(std::memory_order_acquire)) {
+
+			break;
+
+		}
 
 		if (g.prepared_resize_ready.load(std::memory_order_acquire)) {
 
 			commit_prepared_resize_if_ready();
+			epoch_backoff_multiplier = 1;
 
 		}
 

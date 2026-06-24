@@ -12,6 +12,13 @@ PAPI_PREFIX ?= $(HOME)/Desktop/papi/src/install
 CXXFLAGS = -O2 -march=native -Wall -std=c++20 -Imalleable/include -DBENCH_CSV=$(BENCH_CSV)
 LIBS = -lpthread
 
+RD_DYN_PERIOD ?= 6
+RD_DYN_N ?= 50000
+RD_DYN_FAST_US ?= 2000
+RD_DYN_SLOW_US ?= 12000
+RD_DYN_AMP ?= 60
+RD_DYN_JITTER ?= 3
+
 export MAL_RESIZE_ENABLED=1
 export MAL_MALLEABILITY_ENABLED=1
 export MAL_LOAD_BALANCING_ENABLED=1
@@ -56,6 +63,10 @@ TARGET_SP = $(BUILD_DIR)/sparse
 SRCS_SP = examples/sparse.cpp
 OBJS_SP = $(SRCS_SP:%.cpp=$(BUILD_DIR)/%.o)
 
+TARGET_LD = $(BUILD_DIR)/life_dynamic
+SRCS_LD = examples/life_dynamic.cpp
+OBJS_LD = $(SRCS_LD:%.cpp=$(BUILD_DIR)/%.o)
+
 TARGET_RD = $(BUILD_DIR)/resize_demo
 SRCS_RD = examples/resize_demo.cpp
 OBJS_RD = $(SRCS_RD:%.cpp=$(BUILD_DIR)/%.o)
@@ -82,9 +93,9 @@ OBJS_SP_NORMAL = $(SRCS_SP_NORMAL:%.cpp=$(BUILD_DIR)/%.o)
 
 DEPS = $(LIB_OBJS:.o=.d) $(OBJS_MC:.o=.d) $(OBJS_VEC:.o=.d) $(OBJS_MAT:.o=.d) $(OBJS_MV:.o=.d) $(OBJS_SP:.o=.d) $(OBJS_RD:.o=.d) $(OBJS_MC_NORMAL:.o=.d) $(OBJS_VEC_NORMAL:.o=.d) $(OBJS_MM_NORMAL:.o=.d) $(OBJS_MV_NORMAL:.o=.d) $(OBJS_SP_NORMAL:.o=.d)
 
-.PHONY: all run_montecarlo run_vector run_vector_collapse run_matmat run_matvec run_sparse run_montecarlo_normal run_vector_normal run_vector_normal_collapse run_matmat_normal run_matvec_normal run_sparse_normal test clean re
+.PHONY: all run_montecarlo run_vector run_vector_collapse run_matmat run_matvec run_sparse run_resize_demo run_resize_demo_dynamic run_life_dynamic run_montecarlo_normal run_vector_normal run_vector_normal_collapse run_matmat_normal run_matvec_normal run_sparse_normal test clean re
 
-all: $(LIB_MAL) $(TARGET_MC) $(TARGET_VEC) $(TARGET_MAT) $(TARGET_MV) $(TARGET_SP) $(TARGET_RD) $(TARGET_MC_NORMAL) $(TARGET_VEC_NORMAL) $(TARGET_MM_NORMAL) $(TARGET_MV_NORMAL) $(TARGET_SP_NORMAL)
+all: $(LIB_MAL) $(TARGET_MC) $(TARGET_VEC) $(TARGET_MAT) $(TARGET_MV) $(TARGET_SP) $(TARGET_RD) $(TARGET_LD) $(TARGET_MC_NORMAL) $(TARGET_VEC_NORMAL) $(TARGET_MM_NORMAL) $(TARGET_MV_NORMAL) $(TARGET_SP_NORMAL)
 
 $(LIB_MAL): Makefile $(LIB_OBJS)
 	@mkdir -p $(dir $@)
@@ -108,6 +119,9 @@ $(TARGET_SP): $(LIB_MAL) $(OBJS_SP)
 
 $(TARGET_RD): $(LIB_MAL) $(OBJS_RD)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_RD) $(LIB_MAL) $(LIBS)
+
+$(TARGET_LD): $(LIB_MAL) $(OBJS_LD)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_LD) $(LIB_MAL) $(LIBS)
 
 $(TARGET_MC_NORMAL): $(OBJS_MC_NORMAL)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_MC_NORMAL) $(LIBS)
@@ -148,6 +162,19 @@ run_sparse: $(TARGET_SP)
 
 run_resize_demo: $(TARGET_RD)
 	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_RD)
+
+run_resize_demo_dynamic: $(TARGET_RD)
+	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_RD) --dynamic=1 --period_sec=$(RD_DYN_PERIOD) --n=$(RD_DYN_N) --fast_us=$(RD_DYN_FAST_US) --slow_us=$(RD_DYN_SLOW_US) --amp_pct=$(RD_DYN_AMP) --jitter_pct=$(RD_DYN_JITTER)
+
+LD_PERIOD ?= 6
+LD_N ?= 8000
+LD_GRID ?= 96
+LD_FAST_STEPS ?= 1
+LD_SLOW_STEPS ?= 12
+LD_AMP ?= 100
+LD_JITTER ?= 3
+run_life_dynamic: $(TARGET_LD)
+	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_LD) --period_sec=$(LD_PERIOD) --n=$(LD_N) --grid=$(LD_GRID) --fast_steps=$(LD_FAST_STEPS) --slow_steps=$(LD_SLOW_STEPS) --amp_pct=$(LD_AMP) --jitter_pct=$(LD_JITTER)
 
 run_montecarlo_normal: $(TARGET_MC_NORMAL)
 	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_MC_NORMAL)
