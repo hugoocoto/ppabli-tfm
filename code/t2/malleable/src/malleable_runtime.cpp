@@ -1,4 +1,6 @@
 #include "malleable_resizer.cpp"
+#include <csignal>
+#include <cstdlib>
 
 static void log_mpi_error(const char* where, int rc) {
 
@@ -350,6 +352,11 @@ void load_env_config() {
 
 			policy = MAL_RESIZE_POLICY_COST;
 
+		} else if (std::strcmp(v, "balance") == 0 || std::strcmp(v, "BALANCE") == 0 || std::strcmp(v, "lb") == 0 || std::strcmp(v, "LB") == 0) {
+
+			ok = false;
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "MAL_RESIZE_POLICY=balance/lb was REMOVED — use MAL_RESIZE_ENABLED=0 MAL_LOAD_BALANCING_ENABLED=1 (any policy) for fixed-N rebalancing. Ignoring.");
+
 		} else {
 
 			ok = false;
@@ -384,6 +391,82 @@ void load_env_config() {
 		} else {
 
 			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_EPOCH_INTERVAL_MS='%s' (must be > 0)", v);
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_STENCIL_RESID_REDUCES")) {
+
+		long r = std::strtol(v, nullptr, 10);
+
+		if (r > 0) {
+
+			g.cfg.stencil_resid_reduces.store((int)r);
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_STENCIL_RESID_REDUCES=%ld", r);
+
+		} else {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_STENCIL_RESID_REDUCES='%s' (must be > 0)", v);
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_COST_SAMPLE_STEP")) {
+
+		long s = std::strtol(v, nullptr, 10);
+
+		if (s > 0) {
+
+			g.cfg.cost_sample_step.store((int)s);
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_COST_SAMPLE_STEP=%ld", s);
+
+		} else {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_COST_SAMPLE_STEP='%s' (must be > 0)", v);
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_COST_SAMPLE_REFINE")) {
+
+		const bool on = (std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 || std::strcmp(v, "TRUE") == 0 || std::strcmp(v, "yes") == 0);
+		g.cfg.cost_sample_refine.store(on);
+		MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_COST_SAMPLE_REFINE=%d", (int)on);
+
+	}
+
+	if (const char* v = std::getenv("MAL_COST_SAMPLE_MEAS")) {
+
+		long m = std::strtol(v, nullptr, 10);
+
+		if (m > 0) {
+
+			g.cfg.cost_sample_meas.store((int)m);
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_COST_SAMPLE_MEAS=%ld", m);
+
+		} else {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_COST_SAMPLE_MEAS='%s' (must be > 0)", v);
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_STENCIL_EPOCH_STEPS")) {
+
+		long k = std::strtol(v, nullptr, 10);
+
+		if (k > 0) {
+
+			g.cfg.stencil_epoch_steps.store((int)k);
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_STENCIL_EPOCH_STEPS=%ld", k);
+
+		} else {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_STENCIL_EPOCH_STEPS='%s' (must be > 0)", v);
 
 		}
 
@@ -477,6 +560,41 @@ void load_env_config() {
 		} else {
 
 			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_FAST_RESPONSE='%s' (valid bool)", v);
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_COST_KEEP_FRACTION")) {
+
+		char* end = nullptr;
+		double val = std::strtod(v, &end);
+
+		if (end == v || val <= 0.0 || val > 1.0) {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_COST_KEEP_FRACTION='%s' (must be in (0,1])", v);
+
+		} else {
+
+			g.cfg.cost_keep_fraction.store(val, std::memory_order_relaxed);
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_COST_KEEP_FRACTION=%.3f", val);
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_BASELINE_FROM_PERRANK")) {
+
+		bool val = false;
+
+		if (parse_env_bool(v, val)) {
+
+			g.cfg.baseline_from_perrank.store(val, std::memory_order_relaxed);
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_BASELINE_FROM_PERRANK=%d", (int)val);
+
+		} else {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_BASELINE_FROM_PERRANK='%s' (valid bool)", v);
 
 		}
 
@@ -590,7 +708,12 @@ void mal_init(MalResizePolicy policy) {
 
 	g.cfg.resize_policy = policy;
 
+	signal(SIGPIPE, SIG_IGN);
+
 	load_env_config();
+
+	setenv("OMPI_MCA_coll_han_priority", "0", 0);
+	setenv("OMPI_MCA_coll_adapt_priority", "0", 0);
 
 	MPI_Info init_info = MPI_INFO_NULL;
 	MPI_Info_create(&init_info);
@@ -666,9 +789,28 @@ void mal_init(MalResizePolicy policy) {
 
 	MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "Initial active size: %d (universe=%d)", effective_initial_size, g.comm.u_size);
 
-	int color = (g.comm.u_rank < effective_initial_size) ? 0 : MPI_UNDEFINED;
-	rc = MPI_Comm_split(g.comm.universe, color, g.comm.u_rank, &g.comm.active);
-	log_mpi_error("MPI_Comm_split(active, init)", rc);
+	const bool init_immutable = !g.cfg.malleability_enabled.load(std::memory_order_relaxed) || (!g.cfg.enabled.load(std::memory_order_relaxed) && !g.cfg.load_balancing_enabled.load(std::memory_order_relaxed));
+
+	if (init_immutable && effective_initial_size == g.comm.u_size) {
+
+		g.comm.active = g.comm.universe;
+		g.comm.active_borrowed = true;
+
+	} else {
+
+		int color = (g.comm.u_rank < effective_initial_size) ? 0 : MPI_UNDEFINED;
+		rc = MPI_Comm_split(g.comm.universe, color, g.comm.u_rank, &g.comm.active);
+		log_mpi_error("MPI_Comm_split(active, init)", rc);
+
+	}
+
+	if (g.comm.universe != MPI_COMM_NULL && g.comm.u_size > 1) {
+
+		std::vector<char> warm_send(g.comm.u_size, 0), warm_recv(g.comm.u_size, 0);
+		rc = MPI_Alltoall(warm_send.data(), 1, MPI_BYTE, warm_recv.data(), 1, MPI_BYTE, g.comm.universe);
+		log_mpi_error("MPI_Alltoall(universe TCP warmup)", rc);
+
+	}
 
 	g.worker = std::thread(progress_thread);
 
@@ -764,7 +906,7 @@ void vec_gather(MalVec& v) {
 
 	}
 
-	if (g.loop) {
+	if (g.loop && !v.sealed) {
 
 		const long confirmed = g.loop->confirmed_iter.load(std::memory_order_acquire);
 		const long true_done = std::clamp(confirmed + 1 - v.buf_global_start, 0L, v.local_n);
@@ -885,7 +1027,7 @@ void vec_gather(MalVec& v) {
 		data_displs = make_displs(data_counts);
 
 		size_t total_recv = (size_t)(data_displs.back() + data_counts.back());
-		pool_reserve(tl_recv_raw, tl_recv_cap, total_recv > 0 ? total_recv : 1, /*preserve_data=*/false);
+		pool_reserve(tl_recv_raw, tl_recv_cap, total_recv > 0 ? total_recv : 1, false);
 		recv_raw = tl_recv_raw;
 		recv_cap = tl_recv_cap;
 
@@ -950,6 +1092,256 @@ void vec_gather(MalVec& v) {
 
 }
 
+void mal_loop_horizon(long steps_remaining) {
+
+	g.sync.iter_horizon.store(steps_remaining > 1 ? steps_remaining : 1, std::memory_order_release);
+
+	if (steps_remaining > 1) {
+
+		g.sync.iterative_kernel.store(true, std::memory_order_release);
+
+	}
+
+}
+
+void mal_allgather_replicated(MalFor& f, void* full_buf, size_t elem_size, long total_n) {
+
+	if (g.comm.active == MPI_COMM_NULL || g.comm.a_size <= 1 || total_n <= 0) {
+
+		return;
+
+	}
+
+	const int asz = g.comm.a_size;
+
+	long me[2] = { f.start, f.end - f.start };
+	std::vector<long> all((size_t)asz * 2);
+	int rc = MPI_Allgather(me, 2, MPI_LONG, all.data(), 2, MPI_LONG, g.comm.active);
+	log_mpi_error("MPI_Allgather(allgather_replicated meta)", rc);
+
+	std::vector<int> cb((size_t)asz), db((size_t)asz);
+	bool overflow = false;
+
+	for (int r = 0; r < asz; r++) {
+
+		const long st = all[(size_t)r * 2];
+		const long cn = all[(size_t)r * 2 + 1];
+		const long cbytes = cn * (long)elem_size;
+		const long dbytes = st * (long)elem_size;
+
+		if (cbytes > INT_MAX || dbytes > INT_MAX) {
+
+			overflow = true;
+
+		}
+
+		cb[(size_t)r] = (int)cbytes;
+		db[(size_t)r] = (int)dbytes;
+
+	}
+
+	if (overflow) {
+
+		MAL_LOG_L(MAL_LOG_ERROR, "ALLGATHER", "field too large for MPI int counts (total_n=%ld elem=%zu)", total_n, elem_size);
+		MPI_Abort(g.comm.active, 1);
+		return;
+
+	}
+
+	rc = MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, full_buf, cb.data(), db.data(), MPI_BYTE, g.comm.active);
+	log_mpi_error("MPI_Allgatherv(allgather_replicated)", rc);
+
+}
+
+void mal_sync_impl(MalFor& f, void* buf, int count, MPI_Datatype dtype, MPI_Op op) {
+
+	(void)f;
+
+	if (g.comm.active == MPI_COMM_NULL || g.comm.a_size <= 1 || count <= 0) {
+
+		return;
+
+	}
+
+	int rc = MPI_Allreduce(MPI_IN_PLACE, buf, count, dtype, op, g.comm.active);
+	log_mpi_error("MPI_Allreduce(mal_sync)", rc);
+
+}
+
+void mal_bcast_impl(void* buf, int count, MPI_Datatype dtype, int root) {
+
+	if (g.comm.active == MPI_COMM_NULL || g.comm.a_size <= 1 || count <= 0) {
+
+		return;
+
+	}
+
+	int rc = MPI_Bcast(buf, count, dtype, root, g.comm.active);
+	log_mpi_error("MPI_Bcast(mal_bcast)", rc);
+
+}
+
+void halo_exchange_field(MalFor& f, void* buf, size_t elem, long total) {
+
+	if (g.comm.active == MPI_COMM_NULL || g.comm.a_size <= 1 || total <= 0) {
+
+		return;
+
+	}
+
+	const long start = f.start;
+	const long end = f.end;
+
+	if (start >= end) {
+
+		return;
+
+	}
+
+	const int n = g.comm.a_size;
+	const int a = g.comm.a_rank;
+	const int left = (a - 1 + n) % n;
+	const int right = (a + 1) % n;
+
+	char* b = static_cast<char*>(buf);
+	const long gl = (start - 1 + total) % total;
+	const long gr = end % total;
+	const int es = (int)elem;
+
+	int rc = MPI_Sendrecv(b + start * elem, es, MPI_BYTE, left, 0, b + gr * elem, es, MPI_BYTE, right, 0, g.comm.active, MPI_STATUS_IGNORE);
+	log_mpi_error("MPI_Sendrecv(halo left)", rc);
+	rc = MPI_Sendrecv(b + (end - 1) * elem, es, MPI_BYTE, right, 1, b + gl * elem, es, MPI_BYTE, left, 1, g.comm.active, MPI_STATUS_IGNORE);
+	log_mpi_error("MPI_Sendrecv(halo right)", rc);
+
+}
+
+void mal_step_sync(MalFor& f, void* full_buf, size_t elem_size, long total_n) {
+
+	const bool active_set_immutable = !g.cfg.malleability_enabled.load(std::memory_order_relaxed) || (!g.cfg.enabled.load(std::memory_order_relaxed) && !g.cfg.load_balancing_enabled.load(std::memory_order_relaxed));
+
+	if (active_set_immutable) {
+
+		if (g.sync.iter_horizon.load(std::memory_order_acquire) <= 1) {
+
+			mal_allgather_replicated(f, full_buf, elem_size, total_n);
+
+		} else {
+
+			halo_exchange_field(f, full_buf, elem_size, total_n);
+
+		}
+
+		return;
+
+	}
+
+	if (g.sync.stop.load(std::memory_order_acquire)) {
+
+		return;
+
+	}
+
+	f.confirmed_iter.store(f.end, std::memory_order_release);
+
+	g.sync.step_buf = full_buf;
+	g.sync.step_elem = elem_size;
+	g.sync.step_total_n = total_n;
+	g.sync.step_done.store(false, std::memory_order_release);
+	g.sync.step_request.store(true, std::memory_order_release);
+	g.sync.notify();
+
+	g.sync.compute_wait([] {
+
+		return g.sync.step_done.load(std::memory_order_acquire) || g.sync.stop.load(std::memory_order_acquire);
+
+	});
+
+}
+
+void mal_step(MalFor& f, void* full_buf, size_t elem_size, long total_n) {
+
+	const bool active_set_immutable = !g.cfg.malleability_enabled.load(std::memory_order_relaxed) || (!g.cfg.enabled.load(std::memory_order_relaxed) && !g.cfg.load_balancing_enabled.load(std::memory_order_relaxed));
+
+	if (active_set_immutable) {
+
+		mal_step_sync(f, full_buf, elem_size, total_n);
+		return;
+
+	}
+
+	if (g.sync.stop.load(std::memory_order_acquire)) {
+
+		return;
+
+	}
+
+	const long long step_no = g.sync.step_counter.fetch_add(1, std::memory_order_acq_rel) + 1;
+	long long k = g.sync.eval_stride.load(std::memory_order_acquire);
+
+	if (k <= 0) {
+
+		k = g.cfg.stencil_epoch_steps.load(std::memory_order_relaxed);
+
+	}
+
+	if (k < 1) {
+
+		k = 1;
+
+	}
+
+	const bool last_step = g.sync.iter_horizon.load(std::memory_order_acquire) <= 1;
+	const bool finalize_local = g.sync.finalize_requested.load(std::memory_order_acquire);
+	const bool eval_step = last_step || finalize_local || (step_no % (long long)k == 0);
+
+	if (!eval_step) {
+
+		halo_exchange_field(f, full_buf, elem_size, total_n);
+
+		if (g.comm.active != MPI_COMM_NULL && g.comm.a_size > 1 && f.end > f.start) {
+
+			const double* b = static_cast<const double*>(full_buf);
+			double local_res = 0.0;
+
+			if (elem_size == sizeof(double)) {
+
+				for (long i = f.start; i < f.end; i++) {
+
+					local_res += b[(size_t)i] * b[(size_t)i];
+
+				}
+
+			}
+
+			int reduces = g.cfg.stencil_resid_reduces.load(std::memory_order_relaxed);
+
+			if (reduces < 1) {
+
+				reduces = 1;
+
+			}
+
+			for (int rr = 0; rr < reduces; rr++) {
+
+				double res = 0.0;
+				int rc = MPI_Allreduce(&local_res, &res, 1, MPI_DOUBLE, MPI_SUM, g.comm.active);
+				log_mpi_error("MPI_Allreduce(mal_step residual)", rc);
+				local_res = res / (double)g.comm.a_size;
+
+			}
+
+		}
+
+		return;
+
+	}
+
+	g.sync.step_force_eval.store(true, std::memory_order_release);
+	mal_step_sync(f, full_buf, elem_size, total_n);
+	g.sync.step_force_eval.store(false, std::memory_order_release);
+
+}
+
 void mal_finalize() {
 
 	const int saved_u_rank = g.comm.u_rank;
@@ -974,6 +1366,13 @@ void mal_finalize() {
 	t0 = MPI_Wtime();
 	int rc;
 
+	if (g.comm.universe != MPI_COMM_NULL) {
+
+		rc = MPI_Barrier(g.comm.universe);
+		log_mpi_error("MPI_Barrier(finalize entry)", rc);
+
+	}
+
 	std::vector<int> local_gather_roots;
 	std::vector<MalVec*> local_gather_vecs;
 
@@ -988,24 +1387,38 @@ void mal_finalize() {
 
 	}
 
+	const bool active_was_immutable = !g.cfg.malleability_enabled.load(std::memory_order_relaxed) || (!g.cfg.enabled.load(std::memory_order_relaxed) && !g.cfg.load_balancing_enabled.load(std::memory_order_relaxed));
+	const bool reconcile = !active_was_immutable && (g.timing.resize_count > 0);
+
 	int local_n_gathers = (int)local_gather_roots.size();
-	int n_gathers = 0;
-	MPI_Allreduce(&local_n_gathers, &n_gathers, 1, MPI_INT, MPI_MAX, g.comm.universe);
+	int n_gathers = local_n_gathers;
+
+	if (reconcile) {
+
+		MPI_Allreduce(&local_n_gathers, &n_gathers, 1, MPI_INT, MPI_MAX, g.comm.universe);
+
+	}
 
 	if (n_gathers > 0) {
 
-		std::vector<int> roots(n_gathers, 0);
-		int src_candidate = (local_n_gathers == n_gathers) ? g.comm.u_rank : g.comm.u_size;
-		int bcast_src = 0;
-		MPI_Allreduce(&src_candidate, &bcast_src, 1, MPI_INT, MPI_MIN, g.comm.universe);
+		std::vector<int> roots = local_gather_roots;
 
-		if (g.comm.u_rank == bcast_src) {
+		if (reconcile) {
 
-			roots = local_gather_roots;
+			roots.assign(n_gathers, 0);
+			int src_candidate = (local_n_gathers == n_gathers) ? g.comm.u_rank : g.comm.u_size;
+			int bcast_src = 0;
+			MPI_Allreduce(&src_candidate, &bcast_src, 1, MPI_INT, MPI_MIN, g.comm.universe);
+
+			if (g.comm.u_rank == bcast_src) {
+
+				roots = local_gather_roots;
+
+			}
+
+			MPI_Bcast(roots.data(), n_gathers, MPI_INT, bcast_src, g.comm.universe);
 
 		}
-
-		MPI_Bcast(roots.data(), n_gathers, MPI_INT, bcast_src, g.comm.universe);
 
 		for (int gi = 0; gi < n_gathers; gi++) {
 
@@ -1055,8 +1468,12 @@ void mal_finalize() {
 	int naccs = (int)g.accs.size();
 	int local_naccs = naccs;
 
-	rc = MPI_Bcast(&naccs, 1, MPI_INT, 0, g.comm.universe);
-	log_mpi_error("MPI_Bcast(naccs, finalize)", rc);
+	if (reconcile) {
+
+		rc = MPI_Bcast(&naccs, 1, MPI_INT, 0, g.comm.universe);
+		log_mpi_error("MPI_Bcast(naccs, finalize)", rc);
+
+	}
 
 	if (MAL_UNLIKELY(naccs != local_naccs)) {
 
@@ -1135,13 +1552,21 @@ void mal_finalize() {
 
 	g.gather_cache.clear();
 
-	if (g.comm.active != MPI_COMM_NULL) {
+	if (g.comm.universe != MPI_COMM_NULL) {
+
+		rc = MPI_Barrier(g.comm.universe);
+		log_mpi_error("MPI_Barrier(finalize teardown)", rc);
+
+	}
+
+	if (g.comm.active != MPI_COMM_NULL && !g.comm.active_borrowed) {
 
 		rc = MPI_Comm_free(&g.comm.active);
 		log_mpi_error("MPI_Comm_free(active)", rc);
-		g.comm.active = MPI_COMM_NULL;
 
 	}
+
+	g.comm.active = MPI_COMM_NULL;
 
 	rc = MPI_Group_free(&g.comm.world_group);
 	log_mpi_error("MPI_Group_free(world_group)", rc);
@@ -1204,6 +1629,37 @@ inline void maybe_enter_running_phase(MalFor& f, bool ignore_attach_pending_gate
 
 }
 
+static void seal_loop_vecs(MalFor& prev) {
+
+	const long confirmed = prev.confirmed_iter.load(std::memory_order_acquire);
+
+	for (MalVec* v : prev.vecs) {
+
+		if (v == nullptr || v->sealed) {
+
+			continue;
+
+		}
+
+		if (v->total_N > 0) {
+
+			const long true_done = std::clamp(confirmed + 1 - v->buf_global_start, 0L, v->local_n);
+
+			if (true_done > v->done_n) {
+
+				append_done_segments(*v, prev, v->plan_origin_n, v->done_n, true_done);
+				v->done_n = true_done;
+
+			}
+
+		}
+
+		v->sealed = true;
+
+	}
+
+}
+
 MalFor mal_for(long total_iters, long& iter, long& limit) {
 
 	const double t_for_start = MPI_Wtime();
@@ -1212,6 +1668,18 @@ MalFor mal_for(long total_iters, long& iter, long& limit) {
 
 	f.user_iter = &iter;
 	f.user_limit = &limit;
+
+	if (g.loop != nullptr && g.loop != &f) {
+
+		seal_loop_vecs(*g.loop);
+
+	}
+
+	if (g.sync.resize_pending.load(std::memory_order_acquire) && !g.sync.stop.load(std::memory_order_acquire)) {
+
+		g.sync.compute_wait(resize_pending_cleared_or_stop);
+
+	}
 
 	if (g.sync.pending_has_ranges.load(std::memory_order_acquire)) {
 
@@ -1223,8 +1691,24 @@ MalFor mal_for(long total_iters, long& iter, long& limit) {
 		weighted_distribute(total_iters, g.comm.a_size, g.comm.a_rank, f.start, f.end);
 		install_loop_plan(f, {{f.start, f.end}});
 
-		g.lb.epoch_assigned = f.end - f.start;
-		g.lb.epoch_start_time = MPI_Wtime();
+		if (g.sync.iterative_kernel.load(std::memory_order_acquire)) {
+
+			if (g.lb.epoch_start_time <= 0.0) {
+
+				g.lb.epoch_start_time = MPI_Wtime();
+				g.lb.epoch_assigned = 0;
+
+			}
+
+			g.lb.epoch_assigned += f.end - f.start;
+
+		} else {
+
+			g.lb.epoch_assigned = f.end - f.start;
+			g.lb.epoch_start_time = MPI_Wtime();
+
+		}
+
 		f.phase.store(MAL_LOOP_ATTACHING, std::memory_order_relaxed);
 
 	} else {
@@ -1251,7 +1735,9 @@ MalFor mal_for(long total_iters, long& iter, long& limit) {
 
 	g.loop = &f;
 
-	const bool skip_idle_activation_wait = (f.start == f.end) && !g.sync.pending_has_ranges.load(std::memory_order_acquire) && (total_iters <= g.comm.a_size);
+	const bool iterative_loop = g.sync.iterative_kernel.load(std::memory_order_acquire);
+
+	const bool skip_idle_activation_wait = (f.start == f.end) && !g.sync.pending_has_ranges.load(std::memory_order_acquire) && (iterative_loop || total_iters <= g.comm.a_size);
 
 	while (!skip_idle_activation_wait && f.start == f.end && !g.sync.stop.load(std::memory_order_acquire)) {
 
@@ -1306,8 +1792,10 @@ void mal_check_for(MalFor& f) {
 	bool waited = false;
 
 	struct ConfirmedExitGuard {
+
 		MalFor* f;
 		~ConfirmedExitGuard() { f->confirmed_iter.store(*f->user_iter, std::memory_order_release); }
+
 	} confirmed_guard{&f};
 
 	g.sync.compute_epoch.store(f.check_counter++, std::memory_order_relaxed);
@@ -1323,6 +1811,7 @@ void mal_check_for(MalFor& f) {
 		g.sync.compute_wait(attach_pending_cleared_or_stop);
 
 		waited = true;
+
 		if (timing_enabled) {
 
 			const double dt = MPI_Wtime() - t1;
@@ -1331,7 +1820,7 @@ void mal_check_for(MalFor& f) {
 
 		}
 
-		maybe_enter_running_phase(f, /*ignore_attach_pending_gate=*/true);
+		maybe_enter_running_phase(f, true);
 
 	}
 
@@ -1343,6 +1832,7 @@ void mal_check_for(MalFor& f) {
 		g.sync.compute_wait(resize_pending_cleared_or_stop);
 
 		waited = true;
+
 		if (timing_enabled) {
 
 			const double dt = MPI_Wtime() - t1;
@@ -1360,18 +1850,22 @@ void mal_check_for(MalFor& f) {
 		}
 
 		{
+
 			const bool had_new_work = g.sync.loop_has_new_work.load(std::memory_order_relaxed);
 			g.sync.loop_has_new_work.store(false, std::memory_order_relaxed);
 
 			if (g.comm.active != MPI_COMM_NULL && f.start < f.end) {
 
 				if (had_new_work) {
+
 					prime_range_start(f);
+
 				}
 
 				return;
 
 			}
+
 		}
 
 	}
@@ -1396,10 +1890,10 @@ void mal_check_for(MalFor& f) {
 
 	}
 
-	if (!g.cfg.malleability_enabled.load(std::memory_order_relaxed)) {
+	const bool active_set_immutable = !g.cfg.malleability_enabled.load(std::memory_order_relaxed) || (!g.cfg.enabled.load(std::memory_order_relaxed) && !g.cfg.load_balancing_enabled.load(std::memory_order_relaxed));
 
-		g.sync.stop.store(true, std::memory_order_release);
-		g.sync.notify();
+	if (active_set_immutable) {
+
 		return;
 
 	}
@@ -1415,28 +1909,54 @@ void mal_check_for(MalFor& f) {
 
 		if (!has_pending && !has_resize_pending && !has_attach && !has_new_work) {
 
-			if (g.sync.stop.load(std::memory_order_acquire)) break;
+			if (g.sync.stop.load(std::memory_order_acquire)) {
+
+				break;
+
+			}
 
 			const double t1 = timing_enabled ? MPI_Wtime() : 0.0;
 			g.sync.compute_wait([&] {
+
 				return g.sync.stop.load(std::memory_order_acquire) || g.sync.resize_pending.load(std::memory_order_acquire) || g.sync.pending_has_ranges.load(std::memory_order_acquire) || g.sync.loop_has_new_work.load(std::memory_order_acquire);
+
 			});
+
 			waited = true;
 
-			if (timing_enabled) g.timing.check_wait_total += MPI_Wtime() - t1;
+			if (timing_enabled) {
 
-			if (g.sync.stop.load(std::memory_order_acquire)) break;
+				g.timing.check_wait_total += MPI_Wtime() - t1;
+
+			}
+
+			if (g.sync.stop.load(std::memory_order_acquire)) {
+
+				break;
+
+			}
 
 		}
 
 		{
+
 			const double t1 = timing_enabled ? MPI_Wtime() : 0.0;
 			g.sync.compute_wait(resize_pending_cleared_or_stop);
 			waited = true;
-			if (timing_enabled) g.timing.check_wait_total += MPI_Wtime() - t1;
+
+			if (timing_enabled) {
+
+				g.timing.check_wait_total += MPI_Wtime() - t1;
+
+			}
+
 		}
 
-		if (g.sync.stop.load(std::memory_order_acquire)) break;
+		if (g.sync.stop.load(std::memory_order_acquire)) {
+
+			break;
+
+		}
 
 		if (g.sync.pending_has_ranges.load(std::memory_order_acquire)) {
 
@@ -1457,6 +1977,7 @@ void mal_check_for(MalFor& f) {
 		}
 
 		{
+
 			const bool had_new_work = g.sync.loop_has_new_work.load(std::memory_order_relaxed);
 			g.sync.loop_has_new_work.store(false, std::memory_order_relaxed);
 
@@ -1466,9 +1987,14 @@ void mal_check_for(MalFor& f) {
 				break;
 
 			}
+
 		}
 
-		if (f.start < f.end) break;
+		if (f.start < f.end) {
+
+			break;
+
+		}
 
 	}
 
@@ -1679,7 +2205,7 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 
 	}
 
-	maybe_enter_running_phase(f, /*ignore_attach_pending_gate=*/!async_attach);
+	maybe_enter_running_phase(f, !async_attach);
 
 	g.timing.attach_total += MPI_Wtime() - t_attach_start;
 
@@ -1688,6 +2214,131 @@ void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, 
 void mal_attach_vec(MalForND& f, void** user_ptr, size_t elem_size, long total_N, int result_rank, MalAttachPolicy policy, MalAttachExecMode exec_mode, MalDataAccessMode access_mode) {
 
 	mal_attach_vec(mal_for_nd_base(f), user_ptr, elem_size, total_N, result_rank, policy, exec_mode, access_mode);
+
+}
+
+void mal_attach_vec_ragged(MalFor& f, void** user_ptr, size_t elem_size, long total_inner, const long* row_offsets, long n_rows, MalAttachExecMode exec_mode, MalDataAccessMode access_mode) {
+
+	const double t_attach_start = MPI_Wtime();
+	f.phase.store(MAL_LOOP_ATTACHING, std::memory_order_relaxed);
+
+	if (MAL_UNLIKELY(!row_offsets || n_rows < 0)) {
+
+		MAL_LOG_L(MAL_LOG_ERROR, "ATTACH", "mal_attach_vec_ragged: null row_offsets or n_rows<0");
+		return;
+
+	}
+
+	if (MAL_UNLIKELY(g.comm.a_size != g.comm.u_size)) {
+
+		MAL_LOG_L(MAL_LOG_ERROR, "ATTACH", "mal_attach_vec_ragged requires ALL ranks active (a_size=%d u_size=%d) — launch with MAL_START_AT_UNIVERSE=1 and MAL_INITIAL_SIZE=<universe>", g.comm.a_size, g.comm.u_size);
+		MPI_Abort(g.comm.universe, 1);
+
+	}
+
+	auto vp = std::make_unique<MalVec>();
+	MalVec* v = vp.get();
+	void* orig = user_ptr ? *user_ptr : nullptr;
+
+	if (g.comm.u_rank == 0 && orig && total_inner > 0) {
+
+		v->ragged_full_bytes = (size_t)total_inner * elem_size;
+		v->ragged_full_src = std::malloc(v->ragged_full_bytes);
+
+		if (v->ragged_full_src) {
+
+			std::memcpy(v->ragged_full_src, orig, v->ragged_full_bytes);
+
+		} else {
+
+			MAL_LOG_L(MAL_LOG_ERROR, "ATTACH", "mal_attach_vec_ragged: OOM retaining full source (%zu bytes)", v->ragged_full_bytes);
+			MPI_Abort(g.comm.universe, 1);
+
+		}
+
+	}
+
+	const long inner_start = row_offsets[f.start];
+	const long inner_end = row_offsets[f.end];
+	const long n = inner_end - inner_start;
+
+	std::vector<long> inner_cuts;
+
+	if (g.comm.a_size > 0 && g.comm.a_rank >= 0) {
+
+		const std::vector<long> row_cuts = build_partition_cuts(n_rows, g.comm.a_size);
+		inner_cuts.resize(row_cuts.size());
+
+		for (size_t j = 0; j < row_cuts.size(); j++) {
+
+			inner_cuts[j] = row_offsets[row_cuts[j]];
+
+		}
+
+	}
+
+	v->elem_size = elem_size;
+	v->local_n = n;
+	v->buf_global_start = inner_start;
+	v->total_N = total_inner;
+	v->user_ptr = user_ptr;
+	v->gather_root = -1;
+	v->attach_policy = MAL_ATTACH_PARTITIONED;
+	v->access_mode = access_mode;
+	v->cache_valid = false;
+	v->ragged = true;
+	v->ragged_row_offsets = row_offsets;
+	v->ragged_n_rows = n_rows;
+	v->ragged_bases.assign(1, 0);
+
+	v->buf = static_cast<char*>(g_buffer_pool.acquire((v->local_n > 0 ? (size_t)v->local_n : 1) * elem_size));
+	v->buf_bytes = (v->local_n > 0 ? (size_t)v->local_n : 1) * elem_size;
+	v->plan_origin_n = v->done_n;
+
+	const bool inactive_no_pending = (g.comm.active == MPI_COMM_NULL && !g.pending);
+
+	if (inactive_no_pending && user_ptr) {
+
+		*user_ptr = nullptr;
+
+	} else {
+
+		v->sync_user_ptr();
+
+	}
+
+	f.vecs.push_back(v);
+	g.vecs.push_back(std::move(vp));
+
+	const bool async_attach = use_async_attach_mode(exec_mode);
+	const bool can_dispatch_attach = (!g.pending && g.comm.active != MPI_COMM_NULL);
+
+	if (can_dispatch_attach) {
+
+		const size_t total_bytes = (size_t)std::max(0L, total_inner) * elem_size;
+		run_partitioned_attach_scatter(*v, orig, -1, total_bytes, exec_mode, std::move(inner_cuts));
+
+	}
+
+	maybe_enter_running_phase(f, !async_attach);
+
+	g.timing.attach_total += MPI_Wtime() - t_attach_start;
+
+}
+
+void mal_attach_csr(MalFor& f, void** values, size_t value_elem_size, void** col_indices, size_t index_elem_size, long* row_ptr, long n_rows, long nnz) {
+
+	if (MAL_UNLIKELY(!row_ptr || n_rows < 0)) {
+
+		MAL_LOG_L(MAL_LOG_ERROR, "ATTACH", "mal_attach_csr: null row_ptr or n_rows<0");
+		return;
+
+	}
+
+	mal_bcast_impl(row_ptr, (int)(n_rows + 1), MPI_LONG, 0);
+
+	mal_attach_vec_ragged(f, values, value_elem_size, nnz, row_ptr, n_rows);
+	mal_attach_vec_ragged(f, col_indices, index_elem_size, nnz, row_ptr, n_rows);
 
 }
 
@@ -1715,7 +2366,7 @@ void detail::acc_register(MalFor& f, detail::AccDesc d, int result_rank) {
 	f.accs.push_back(a);
 	g.accs.push_back(std::move(ap));
 
-	maybe_enter_running_phase(f, /*ignore_attach_pending_gate=*/true);
+	maybe_enter_running_phase(f, true);
 
 }
 
@@ -1775,7 +2426,7 @@ void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n
 
 		g.shared.push_back(std::move(sp));
 
-		maybe_enter_running_phase(f, /*ignore_attach_pending_gate=*/!async_attach);
+		maybe_enter_running_phase(f, !async_attach);
 
 		g.timing.attach_total += MPI_Wtime() - t_mat_start;
 
@@ -1830,7 +2481,7 @@ void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n
 
 	g.shared.push_back(std::move(sp));
 
-	maybe_enter_running_phase(f, /*ignore_attach_pending_gate=*/!async_attach);
+	maybe_enter_running_phase(f, !async_attach);
 
 	g.timing.attach_total += MPI_Wtime() - t_mat_start;
 

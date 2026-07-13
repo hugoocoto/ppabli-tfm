@@ -136,7 +136,7 @@ int main(int argc, char* argv[]) {
 
 		#if BENCH_CSV
 
-			print_bench_csv("sparse", "malleable", "std", mal_size(), M, compute_seconds, 0);
+			print_bench_csv("sparse", "malleable", "std", mal_size(), mal_active_size(), M, compute_seconds, 0);
 
 		#else
 

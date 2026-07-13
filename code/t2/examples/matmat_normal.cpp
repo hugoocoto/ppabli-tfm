@@ -107,7 +107,7 @@ int main(int argc, char* argv[]) {
 
 		#if BENCH_CSV
 
-			print_bench_csv("matmat", "normal", "mm", world_size, M * N, t1 - t0, 0);
+			print_bench_csv("matmat", "normal", "mm", world_size, world_size, M * N, t1 - t0, 0);
 
 		#else
 

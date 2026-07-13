@@ -143,7 +143,7 @@ int main(int argc, char* argv[]) {
 
 		#if BENCH_CSV
 
-			print_bench_csv("vector", "malleable", use_collapse ? "collapse" : "flat", mal_size(), total_n, compute_seconds, 0);
+			print_bench_csv("vector", "malleable", use_collapse ? "collapse" : "flat", mal_size(), mal_active_size(), total_n, compute_seconds, 0);
 
 		#else
 

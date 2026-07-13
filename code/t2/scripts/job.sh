@@ -36,16 +36,23 @@ CONTINUE_ON_ERROR=${MAL_CONTINUE_ON_ERROR:-0}
 export OMPI_MCA_pml=ob1
 export OMPI_MCA_btl=self,vader,tcp
 
-export MAL_RESIZE_ENABLED=1
-export MAL_MALLEABILITY_ENABLED=1
-export MAL_LOAD_BALANCING_ENABLED=1
-export MAL_INITIAL_SIZE=1
-export MAL_AFFINITY=0
-export MAL_EPOCH_INTERVAL_MS=100
-export MAL_LOG_LEVEL=DEBUG
-export MAL_EPOCH_CHANGE_MODE=1
-export MAL_TIMING=0
-export MAL_LOG_ALL_RANKS=0
+export MAL_RESIZE_ENABLED="${MAL_RESIZE_ENABLED:-1}"
+export MAL_MALLEABILITY_ENABLED="${MAL_MALLEABILITY_ENABLED:-1}"
+export MAL_LOAD_BALANCING_ENABLED="${MAL_LOAD_BALANCING_ENABLED:-1}"
+
+if [[ "${MAL_START_AT_UNIVERSE:-0}" -eq 1 ]]; then
+	export MAL_INITIAL_SIZE="$NPROC"
+else
+	export MAL_INITIAL_SIZE="${MAL_INITIAL_SIZE:-1}"
+fi
+
+export MAL_AFFINITY="${MAL_AFFINITY:-0}"
+export MAL_EPOCH_INTERVAL_MS="${MAL_EPOCH_INTERVAL_MS:-100}"
+
+export MAL_LOG_LEVEL="${MAL_LOG_LEVEL:-ERROR}"
+export MAL_EPOCH_CHANGE_MODE="${MAL_EPOCH_CHANGE_MODE:-1}"
+export MAL_TIMING="${MAL_TIMING:-0}"
+export MAL_LOG_ALL_RANKS="${MAL_LOG_ALL_RANKS:-0}"
 
 run_single() {
 
@@ -86,7 +93,7 @@ run_single() {
 
 	else
 
-		result_line="${exec_name},${NPROC},${iter},${elapsed},${exit_code}"
+		result_line="${exec_name},NA,NA,${NPROC},${NPROC},NA,${elapsed},NA,${iter},${exit_code}"
 
 	fi
 

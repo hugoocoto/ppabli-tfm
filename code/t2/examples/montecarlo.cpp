@@ -60,7 +60,7 @@ int main(int argc, char* argv[]) {
 
 		#if BENCH_CSV
 
-			print_bench_csv("montecarlo", "malleable", "std", mal_size(), total_points, compute_seconds, 0);
+			print_bench_csv("montecarlo", "malleable", "std", mal_size(), mal_active_size(), total_points, compute_seconds, 0);
 
 		#else
 
@@ -75,4 +75,3 @@ int main(int argc, char* argv[]) {
 	return EXIT_SUCCESS;
 
 }
-

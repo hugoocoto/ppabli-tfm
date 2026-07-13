@@ -104,7 +104,7 @@ int main(int argc, char* argv[]) {
 
 		#if BENCH_CSV
 
-			print_bench_csv("matvec", "normal", "mv", world_size, M, t1 - t0, 0);
+			print_bench_csv("matvec", "normal", "mv", world_size, world_size, M, t1 - t0, 0);
 
 		#else
 

@@ -50,13 +50,12 @@ struct ResizeDecision {
 };
 
 enum EpochChangeMode {
-	MAL_EPOCH_CHANGE_RECALCULATE = 0,
-	MAL_EPOCH_CHANGE_USE_LAST_DECISION = 1,
-};
+
+	MAL_EPOCH_CHANGE_RECALCULATE = 0, MAL_EPOCH_CHANGE_USE_LAST_DECISION = 1, };
 
 constexpr int kDefaultInitialSize = INT_MAX;
 constexpr int kDefaultEpochIntervalMs = 1000;
-constexpr int kDefaultEpochChangeMode = MAL_EPOCH_CHANGE_RECALCULATE;
+constexpr int kDefaultEpochChangeMode = MAL_EPOCH_CHANGE_USE_LAST_DECISION;
 constexpr MalLogLevel kDefaultLogLevel = MAL_LOG_INFO;
 constexpr bool kDefaultLogAllRanks = false;
 constexpr bool kDefaultAffinityEnabled = true;
@@ -85,21 +84,27 @@ public:
 
 private:
 	struct Entry {
+
 		void* ptr;
 		size_t capacity;
+
 	};
 
 	std::unordered_map<size_t, std::vector<Entry>> buckets_;
 	std::mutex mtx_;
 
 	struct TLSlot {
+
 		void* ptr{nullptr};
 		size_t cap{0};
+
 	};
 
 	struct TLBucket {
+
 		TLSlot slots[kTLCacheSlots]{};
 		int count{0};
+
 	};
 
 	using TLMap = std::unordered_map<size_t, TLBucket>;
@@ -154,7 +159,6 @@ public:
 		return size_t{1} << (64 - clz64((unsigned long long)(bytes - 1)));
 
 	}
-
 
 	~BufferPool() {
 
@@ -288,6 +292,14 @@ struct alignas(64) MalVec {
 	MalAttachPolicy attach_policy{MAL_ATTACH_PARTITIONED};
 	MalDataAccessMode access_mode{MAL_ACCESS_READ_WRITE};
 	bool cache_valid{false};
+	bool sealed{false};
+
+	bool ragged{false};
+	const long* ragged_row_offsets{nullptr};
+	long ragged_n_rows{0};
+	void* ragged_full_src{nullptr};
+	size_t ragged_full_bytes{0};
+	std::vector<long> ragged_bases;
 
 	std::vector<std::pair<long,long>> done_segs;
 
@@ -389,6 +401,7 @@ struct MalState {
 		MPI_Comm active{MPI_COMM_NULL};
 		int a_rank{-1};
 		int a_size{0};
+		bool active_borrowed{false};
 
 	} comm;
 
@@ -405,7 +418,18 @@ struct MalState {
 		std::atomic<bool> malleability_enabled{kDefaultMalleabilityEnabled};
 		std::atomic<bool> load_balancing_enabled{kDefaultLoadBalancingEnabled};
 		std::atomic<bool> fast_response{false};
+		std::atomic<double> cost_keep_fraction{0.97};
+		std::atomic<bool> baseline_from_perrank{false};
 		std::atomic<MalAttachExecMode> attach_mode{MAL_ATTACH_SYNC};
+		std::atomic<int> stencil_epoch_steps{64};
+
+		std::atomic<int> stencil_resid_reduces{1};
+
+		std::atomic<int> cost_sample_step{8};
+
+		std::atomic<bool> cost_sample_refine{false};
+
+		std::atomic<int> cost_sample_meas{3};
 
 		bool affinity_enabled{kDefaultAffinityEnabled};
 		int main_core{kDefaultMainCore};
@@ -426,12 +450,22 @@ struct MalState {
 		alignas(64) std::atomic<bool> pending_has_ranges{false};
 		alignas(64) std::atomic<unsigned long long> compute_epoch{0};
 		alignas(64) std::atomic<bool> finalize_requested{false};
+		alignas(64) std::atomic<long> iter_horizon{1};
+		alignas(64) std::atomic<bool> iterative_kernel{false};
+
+		alignas(64) std::atomic<bool> step_request{false};
+		alignas(64) std::atomic<bool> step_done{false};
+		alignas(64) std::atomic<long long> step_counter{0};
+		alignas(64) std::atomic<bool> step_force_eval{false};
+		alignas(64) std::atomic<long long> eval_stride{0};
+		void* step_buf{nullptr};
+		size_t step_elem{0};
+		long step_total_n{0};
 
 		alignas(64) std::mutex mu;
 		std::condition_variable cv;
 
-		template<typename Pred>
-		void compute_wait(Pred ready) {
+		template<typename Pred> void compute_wait(Pred ready) {
 
 			if (ready()) {
 
@@ -518,19 +552,39 @@ struct MalState {
 		int same_size_rebalance_cooldown{0};
 		int prev_resize_from{0};
 		int prev_resize_to{0};
+		bool last_commit_grew{false};
 
 		enum class Phase : int8_t {
-			IDLE = 0,
-			NEEDS_BASELINE,
-			EXPLORE_MAX,
-			SEARCHING,
-			PROBING
+
+			IDLE = 0, NEEDS_BASELINE, EXPLORE_MAX, SEARCHING, PROBING, COST_RAMP, COST_DESCENT, COST_SAMPLE, COST_SETTLED
+
 		};
 
 		Phase bs_phase{Phase::IDLE};
 		int bs_lo{1};
 		int bs_hi{-1};
 		int bs_baseline_count{0};
+		int my_slow_streak{0};
+		int gate_fire_streak{0};
+		int gate_giveup_at_n{-1};
+
+		double cost_best_g{0.0};
+		int cost_best_n{0};
+		double cost_prev_g{0.0};
+		int cost_prev_n{-1};
+		int cost_settle_recheck{0};
+		int cost_stop_streak{0};
+
+		int sample_target{0};
+		int sample_min{0};
+		int sample_step{0};
+		int sample_coarse_step{0};
+		bool sample_fine{false};
+		int sample_dwell_left{0};
+		int sample_meas_left{0};
+		double sample_thr_accum{0.0};
+		double sample_best_thr{0.0};
+		int sample_best_n{0};
 
 	} lb;
 
@@ -621,13 +675,8 @@ MalFor::MalFor(MalFor&& other) noexcept : start(other.start), end(other.end), cu
 static int detect_node_local_rank(int fallback_rank) {
 
 	static const char* const kLocalRankVars[] = {
-		"OMPI_COMM_WORLD_LOCAL_RANK",
-		"SLURM_LOCALID",
-		"MPI_LOCALRANKID",
-		"MV2_COMM_WORLD_LOCAL_RANK",
-		"PMIX_LOCAL_RANK",
-		"PMI_LOCAL_RANK",
-	};
+
+		"OMPI_COMM_WORLD_LOCAL_RANK", "SLURM_LOCALID", "MPI_LOCALRANKID", "MV2_COMM_WORLD_LOCAL_RANK", "PMIX_LOCAL_RANK", "PMI_LOCAL_RANK", };
 
 	for (const char* var : kLocalRankVars) {
 
@@ -657,6 +706,7 @@ static int detect_node_local_rank(int fallback_rank) {
 		std::vector<std::pair<int, unsigned long>> cores;
 
 		try {
+
 			for (const auto& entry : std::filesystem::directory_iterator("/sys/devices/system/cpu/")) {
 
 				const std::string name = entry.path().filename().string();
@@ -791,6 +841,7 @@ static int detect_node_local_rank(int fallback_rank) {
 
 			maxv = std::max(maxv, v);
 			minv = std::min(minv, v);
+
 		}
 
 		if (maxv == minv) {
@@ -1065,7 +1116,6 @@ const char* mal_log_level_name(MalLogLevel level) {
 
 }
 
-
 const MPI_Datatype kDtypeTbl[] = {MPI_INT, MPI_LONG, MPI_LONG_LONG, MPI_UNSIGNED, MPI_UNSIGNED_LONG, MPI_FLOAT, MPI_DOUBLE};
 
 const MPI_Op kDopTbl[] = {MPI_SUM, MPI_PROD, MPI_MAX, MPI_MIN};
@@ -1179,8 +1229,7 @@ void write_identity(char* dst, int dtype_tag, int dop_tag, int esz) {
 
 }
 
-template<typename T>
-inline void combine_with_op_t(void* dst, const void* src, int dop) {
+template<typename T> inline void combine_with_op_t(void* dst, const void* src, int dop) {
 
 	T& d = *static_cast<T*>(dst);
 	const T& s = *static_cast<const T*>(src);
@@ -1905,8 +1954,7 @@ void load_pending_ranges_into_loop(MalFor& f) {
 
 }
 
-template<typename GetAcc, typename OnResult>
-void batched_allreduce(int n, GetAcc get_acc, OnResult on_result) {
+template<typename GetAcc, typename OnResult> void batched_allreduce(int n, GetAcc get_acc, OnResult on_result) {
 
 	if (n == 0) {
 
@@ -1939,6 +1987,7 @@ void batched_allreduce(int n, GetAcc get_acc, OnResult on_result) {
 	int ai = 0;
 
 	while (ai < n) {
+
 		int ae = ai + 1;
 		int esz = meta[ai].esz;
 
@@ -2016,6 +2065,22 @@ void sync_vec_mapping_for_current_range(MalFor& f) {
 	for (MalVec* v : f.vecs) {
 
 		if (!v || vec_is_fully_replicated(*v)) {
+
+			continue;
+
+		}
+
+		if (v->ragged) {
+
+			const long base = (f.plan_idx < v->ragged_bases.size()) ? v->ragged_bases[f.plan_idx] : 0;
+			const long new_gs = v->ragged_row_offsets[f.start] - base;
+
+			if (v->buf_global_start != new_gs) {
+
+				v->buf_global_start = new_gs;
+				v->sync_user_ptr();
+
+			}
 
 			continue;
 
@@ -2603,6 +2668,14 @@ void MalVec::free_resources() {
 		g_buffer_pool.release(buf, buf_bytes > 0 ? buf_bytes : 1);
 		buf = nullptr;
 		buf_bytes = 0;
+
+	}
+
+	if (ragged_full_src) {
+
+		std::free(ragged_full_src);
+		ragged_full_src = nullptr;
+		ragged_full_bytes = 0;
 
 	}
 

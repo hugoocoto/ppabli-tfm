@@ -56,7 +56,7 @@ for EXEC in "${EXECS[@]}"; do
 
 	if [[ ! -f "$CSV" ]]; then
 
-		echo "exec,version,mode,nproc,n,time,errors,iter,exit_code" > "$CSV"
+		echo "exec,version,mode,nproc,nproc_active,n,time,errors,iter,exit_code" > "$CSV"
 
 	fi
 

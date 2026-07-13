@@ -5,6 +5,7 @@ MPIRUN = mpirun
 NP = 8
 BENCH_CSV ?= 0
 TEST_RUNS ?= 10
+NORM_N ?= 4000
 
 USE_PAPI ?= 0
 PAPI_PREFIX ?= $(HOME)/Desktop/papi/src/install
@@ -71,6 +72,18 @@ TARGET_RD = $(BUILD_DIR)/resize_demo
 SRCS_RD = examples/resize_demo.cpp
 OBJS_RD = $(SRCS_RD:%.cpp=$(BUILD_DIR)/%.o)
 
+TARGET_SPMV = $(BUILD_DIR)/spmv_imbal
+SRCS_SPMV = examples/spmv_imbal.cpp
+OBJS_SPMV = $(SRCS_SPMV:%.cpp=$(BUILD_DIR)/%.o)
+
+TARGET_SPMV_CSR = $(BUILD_DIR)/spmv_csr
+SRCS_SPMV_CSR = examples/spmv_csr.cpp
+OBJS_SPMV_CSR = $(SRCS_SPMV_CSR:%.cpp=$(BUILD_DIR)/%.o)
+
+TARGET_SPMV_NORMAL = $(BUILD_DIR)/spmv_imbal_normal
+SRCS_SPMV_NORMAL = examples/spmv_imbal_normal.cpp
+OBJS_SPMV_NORMAL = $(SRCS_SPMV_NORMAL:%.cpp=$(BUILD_DIR)/%.o)
+
 TARGET_MC_NORMAL = $(BUILD_DIR)/montecarlo_normal
 SRCS_MC_NORMAL = examples/montecarlo_normal.cpp
 OBJS_MC_NORMAL = $(SRCS_MC_NORMAL:%.cpp=$(BUILD_DIR)/%.o)
@@ -91,11 +104,27 @@ TARGET_SP_NORMAL = $(BUILD_DIR)/sparse_normal
 SRCS_SP_NORMAL = examples/sparse_normal.cpp
 OBJS_SP_NORMAL = $(SRCS_SP_NORMAL:%.cpp=$(BUILD_DIR)/%.o)
 
-DEPS = $(LIB_OBJS:.o=.d) $(OBJS_MC:.o=.d) $(OBJS_VEC:.o=.d) $(OBJS_MAT:.o=.d) $(OBJS_MV:.o=.d) $(OBJS_SP:.o=.d) $(OBJS_RD:.o=.d) $(OBJS_MC_NORMAL:.o=.d) $(OBJS_VEC_NORMAL:.o=.d) $(OBJS_MM_NORMAL:.o=.d) $(OBJS_MV_NORMAL:.o=.d) $(OBJS_SP_NORMAL:.o=.d)
+TARGET_HEAT_NORMAL = $(BUILD_DIR)/heat_normal
+SRCS_HEAT_NORMAL = examples/heat_normal.cpp
+OBJS_HEAT_NORMAL = $(SRCS_HEAT_NORMAL:%.cpp=$(BUILD_DIR)/%.o)
 
-.PHONY: all run_montecarlo run_vector run_vector_collapse run_matmat run_matvec run_sparse run_resize_demo run_resize_demo_dynamic run_life_dynamic run_montecarlo_normal run_vector_normal run_vector_normal_collapse run_matmat_normal run_matvec_normal run_sparse_normal test clean re
+TARGET_HEAT = $(BUILD_DIR)/heat
+SRCS_HEAT = examples/heat.cpp
+OBJS_HEAT = $(SRCS_HEAT:%.cpp=$(BUILD_DIR)/%.o)
 
-all: $(LIB_MAL) $(TARGET_MC) $(TARGET_VEC) $(TARGET_MAT) $(TARGET_MV) $(TARGET_SP) $(TARGET_RD) $(TARGET_LD) $(TARGET_MC_NORMAL) $(TARGET_VEC_NORMAL) $(TARGET_MM_NORMAL) $(TARGET_MV_NORMAL) $(TARGET_SP_NORMAL)
+TARGET_NORM = $(BUILD_DIR)/normalize
+SRCS_NORM = examples/normalize.cpp
+OBJS_NORM = $(SRCS_NORM:%.cpp=$(BUILD_DIR)/%.o)
+
+TARGET_NORM_NORMAL = $(BUILD_DIR)/normalize_normal
+SRCS_NORM_NORMAL = examples/normalize_normal.cpp
+OBJS_NORM_NORMAL = $(SRCS_NORM_NORMAL:%.cpp=$(BUILD_DIR)/%.o)
+
+DEPS =$(LIB_OBJS:.o=.d) $(OBJS_MC:.o=.d) $(OBJS_VEC:.o=.d) $(OBJS_MAT:.o=.d) $(OBJS_MV:.o=.d) $(OBJS_SP:.o=.d) $(OBJS_RD:.o=.d) $(OBJS_LD:.o=.d) $(OBJS_SPMV:.o=.d) $(OBJS_SPMV_NORMAL:.o=.d) $(OBJS_MC_NORMAL:.o=.d) $(OBJS_VEC_NORMAL:.o=.d) $(OBJS_MM_NORMAL:.o=.d) $(OBJS_MV_NORMAL:.o=.d) $(OBJS_SP_NORMAL:.o=.d)
+
+.PHONY: all run_montecarlo run_vector run_vector_collapse run_normalize run_normalize_normal run_matmat run_matvec run_sparse run_resize_demo run_resize_demo_dynamic run_life_dynamic run_spmv_imbal run_spmv_csr run_spmv_imbal_normal run_montecarlo_normal run_vector_normal run_vector_normal_collapse run_matmat_normal run_matvec_normal run_sparse_normal test clean re
+
+all: $(LIB_MAL) $(TARGET_MC) $(TARGET_VEC) $(TARGET_MAT) $(TARGET_MV) $(TARGET_SP) $(TARGET_RD) $(TARGET_LD) $(TARGET_SPMV) $(TARGET_SPMV_NORMAL) $(TARGET_MC_NORMAL) $(TARGET_VEC_NORMAL) $(TARGET_MM_NORMAL) $(TARGET_MV_NORMAL) $(TARGET_SP_NORMAL) $(TARGET_HEAT_NORMAL) $(TARGET_HEAT) $(TARGET_NORM) $(TARGET_NORM_NORMAL) $(TARGET_SPMV_CSR)
 
 $(LIB_MAL): Makefile $(LIB_OBJS)
 	@mkdir -p $(dir $@)
@@ -123,6 +152,15 @@ $(TARGET_RD): $(LIB_MAL) $(OBJS_RD)
 $(TARGET_LD): $(LIB_MAL) $(OBJS_LD)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_LD) $(LIB_MAL) $(LIBS)
 
+$(TARGET_SPMV): $(LIB_MAL) $(OBJS_SPMV)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_SPMV) $(LIB_MAL) $(LIBS)
+
+$(TARGET_SPMV_CSR): $(LIB_MAL) $(OBJS_SPMV_CSR)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_SPMV_CSR) $(LIB_MAL) $(LIBS)
+
+$(TARGET_SPMV_NORMAL): $(OBJS_SPMV_NORMAL)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_SPMV_NORMAL) $(LIBS)
+
 $(TARGET_MC_NORMAL): $(OBJS_MC_NORMAL)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_MC_NORMAL) $(LIBS)
 
@@ -135,6 +173,18 @@ $(TARGET_MM_NORMAL): $(OBJS_MM_NORMAL)
 $(TARGET_MV_NORMAL): $(OBJS_MV_NORMAL)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_MV_NORMAL) $(LIBS)
 
+$(TARGET_HEAT_NORMAL): $(OBJS_HEAT_NORMAL)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_HEAT_NORMAL) $(LIBS)
+
+$(TARGET_HEAT): $(LIB_MAL) $(OBJS_HEAT)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_HEAT) $(LIB_MAL) $(LIBS)
+
+$(TARGET_NORM): $(LIB_MAL) $(OBJS_NORM)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_NORM) $(LIB_MAL) $(LIBS)
+
+$(TARGET_NORM_NORMAL): $(OBJS_NORM_NORMAL)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_NORM_NORMAL) $(LIBS)
+
 $(TARGET_SP_NORMAL): $(OBJS_SP_NORMAL)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_SP_NORMAL) $(LIBS)
 
@@ -142,23 +192,31 @@ $(BUILD_DIR)/%.o: %.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+TRANSPARENT = MAL_RESIZE_ENABLED=0 MAL_LOAD_BALANCING_ENABLED=0 MAL_INITIAL_SIZE=$(NP)
+
 run_montecarlo: $(TARGET_MC)
-	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_MC)
+	$(TRANSPARENT) $(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_MC)
 
 run_vector: $(TARGET_VEC)
-	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_VEC)
+	$(TRANSPARENT) $(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_VEC)
 
 run_vector_collapse: $(TARGET_VEC)
-	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_VEC) collapse
+	$(TRANSPARENT) $(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_VEC) collapse
+
+run_normalize: $(TARGET_NORM)
+	$(TRANSPARENT) $(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_NORM) --n=$(NORM_N)
+
+run_normalize_normal: $(TARGET_NORM_NORMAL)
+	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_NORM_NORMAL) --n=$(NORM_N)
 
 run_matmat: $(TARGET_MAT)
-	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_MAT)
+	$(TRANSPARENT) $(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_MAT)
 
 run_matvec: $(TARGET_MV)
-	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_MV)
+	$(TRANSPARENT) $(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_MV)
 
 run_sparse: $(TARGET_SP)
-	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_SP)
+	$(TRANSPARENT) $(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_SP)
 
 run_resize_demo: $(TARGET_RD)
 	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_RD)
@@ -173,8 +231,37 @@ LD_FAST_STEPS ?= 1
 LD_SLOW_STEPS ?= 12
 LD_AMP ?= 100
 LD_JITTER ?= 3
+
 run_life_dynamic: $(TARGET_LD)
 	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_LD) --period_sec=$(LD_PERIOD) --n=$(LD_N) --grid=$(LD_GRID) --fast_steps=$(LD_FAST_STEPS) --slow_steps=$(LD_SLOW_STEPS) --amp_pct=$(LD_AMP) --jitter_pct=$(LD_JITTER)
+
+SPMV_FILE ?=
+SPMV_SYNTH ?= 200000
+SPMV_AVGDEG ?= 20
+SPMV_PATTERN ?= clustered
+SPMV_CONTRAST ?= 8
+SPMV_CLUSTER_FRAC ?= 0.25
+SPMV_REPS ?= 2000
+
+ifeq ($(strip $(SPMV_FILE)),)
+	SPMV_SRC_ARGS = --synthetic=$(SPMV_SYNTH) --avg_deg=$(SPMV_AVGDEG) --pattern=$(SPMV_PATTERN) --contrast=$(SPMV_CONTRAST) --cluster_frac=$(SPMV_CLUSTER_FRAC)
+else
+	SPMV_SRC_ARGS = --file=$(SPMV_FILE)
+endif
+	SPMV_ARGS = $(SPMV_SRC_ARGS) --reps=$(SPMV_REPS)
+
+SPMV_MAL_ENV = MAL_MALLEABILITY_ENABLED=1 MAL_RESIZE_ENABLED=1 MAL_LOAD_BALANCING_ENABLED=1 MAL_RESIZE_POLICY=balance MAL_INITIAL_SIZE=$(NP) MAL_AFFINITY=0 MAL_EPOCH_INTERVAL_MS=50 MAL_EPOCH_CHANGE_MODE=1
+
+run_spmv_imbal: $(TARGET_SPMV)
+	$(SPMV_MAL_ENV) $(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_SPMV) $(SPMV_ARGS)
+
+SPMV_CSR_ENV = MAL_MALLEABILITY_ENABLED=1 MAL_RESIZE_ENABLED=0 MAL_LOAD_BALANCING_ENABLED=1 MAL_START_AT_UNIVERSE=1 MAL_INITIAL_SIZE=$(NP) MAL_AFFINITY=0 MAL_EPOCH_INTERVAL_MS=60
+
+run_spmv_csr: $(TARGET_SPMV_CSR)
+	$(SPMV_CSR_ENV) $(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_SPMV_CSR) $(SPMV_ARGS)
+
+run_spmv_imbal_normal: $(TARGET_SPMV_NORMAL)
+	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_SPMV_NORMAL) $(SPMV_ARGS)
 
 run_montecarlo_normal: $(TARGET_MC_NORMAL)
 	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_MC_NORMAL)

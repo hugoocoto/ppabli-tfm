@@ -90,10 +90,8 @@ inline void papi_load_env_overrides() {
 #ifdef MAL_USE_PAPI
 
 	constexpr int kPapiEventCodes[kNumPapiEvents] = {
-		PAPI_TOT_CYC,
-		PAPI_TOT_INS,
-		PAPI_L3_TCM,
-		PAPI_REF_CYC,
+
+		PAPI_TOT_CYC, PAPI_TOT_INS, PAPI_L3_TCM, PAPI_REF_CYC,
 	};
 
 	int g_papi_eventset = PAPI_NULL;
@@ -260,7 +258,11 @@ double papi_energy_per_iter(const long long vals[kNumPapiEvents], long done) {
 
 double papi_ipc(const long long vals[kNumPapiEvents]) {
 
-	if (vals[0] <= 0 || vals[1] <= 0) return 0.0;
+	if (vals[0] <= 0 || vals[1] <= 0) {
+
+		return 0.0;
+
+	}
 
 	return (double)vals[1] / (double)vals[0];
 

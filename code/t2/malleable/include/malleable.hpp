@@ -20,10 +20,9 @@ int mal_active_size();
 double mal_t_origin();
 
 enum MalLogLevel {
-	MAL_LOG_DEBUG,
-	MAL_LOG_INFO,
-	MAL_LOG_WARN,
-	MAL_LOG_ERROR,
+
+	MAL_LOG_DEBUG, MAL_LOG_INFO, MAL_LOG_WARN, MAL_LOG_ERROR,
+
 };
 
 const char* mal_log_level_name(MalLogLevel level);
@@ -36,35 +35,33 @@ struct MalVec;
 struct MalAcc;
 
 enum MalLoopPhase {
-	MAL_LOOP_WAITING_ACTIVATION,
-	MAL_LOOP_ATTACHING,
-	MAL_LOOP_RUNNING,
-	MAL_LOOP_FINISHED,
+
+	MAL_LOOP_WAITING_ACTIVATION, MAL_LOOP_ATTACHING, MAL_LOOP_RUNNING, MAL_LOOP_FINISHED,
+
 };
 
 enum MalAttachPolicy {
-	MAL_ATTACH_PARTITIONED,
-	MAL_ATTACH_SHARED_ACTIVE,
-	MAL_ATTACH_SHARED_ALL,
+
+	MAL_ATTACH_PARTITIONED, MAL_ATTACH_SHARED_ACTIVE, MAL_ATTACH_SHARED_ALL,
+
 };
 
 enum MalAttachExecMode {
-	MAL_ATTACH_INHERIT,
-	MAL_ATTACH_SYNC,
-	MAL_ATTACH_ASYNC,
+
+	MAL_ATTACH_INHERIT, MAL_ATTACH_SYNC, MAL_ATTACH_ASYNC,
+
 };
 
 enum MalDataAccessMode {
-	MAL_ACCESS_READ_WRITE,
-	MAL_ACCESS_READ_ONLY,
+
+	MAL_ACCESS_READ_WRITE, MAL_ACCESS_READ_ONLY,
+
 };
 
 enum MalResizePolicy {
-	MAL_RESIZE_POLICY_AUTO,
-	MAL_RESIZE_POLICY_THROUGHPUT,
-	MAL_RESIZE_POLICY_EFFICIENCY,
-	MAL_RESIZE_POLICY_FIXED_SEQUENCE,
-	MAL_RESIZE_POLICY_COST,
+
+	MAL_RESIZE_POLICY_AUTO, MAL_RESIZE_POLICY_THROUGHPUT, MAL_RESIZE_POLICY_EFFICIENCY, MAL_RESIZE_POLICY_FIXED_SEQUENCE, MAL_RESIZE_POLICY_COST,
+
 };
 
 template<typename T> struct MpiType;
@@ -143,7 +140,9 @@ struct MalForND {
 	MalForND& operator=(const MalForND&) = delete;
 
 	MalForND(MalForND&& other) noexcept {
+
 		*this = std::move(other);
+
 	}
 
 	MalForND& operator=(MalForND&& other) noexcept {
@@ -190,6 +189,24 @@ void mal_check_for(MalForND& f);
 void mal_attach_vec(MalFor& f, void** user_ptr, size_t elem_size, long total_N, int result_rank = -1, MalAttachPolicy policy = MAL_ATTACH_PARTITIONED, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT, MalDataAccessMode access_mode = MAL_ACCESS_READ_WRITE);
 void mal_attach_vec(MalForND& f, void** user_ptr, size_t elem_size, long total_N, int result_rank = -1, MalAttachPolicy policy = MAL_ATTACH_PARTITIONED, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT, MalDataAccessMode access_mode = MAL_ACCESS_READ_WRITE);
 
+void mal_attach_vec_ragged(MalFor& f, void** user_ptr, size_t elem_size, long total_inner, const long* row_offsets, long n_rows, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT, MalDataAccessMode access_mode = MAL_ACCESS_READ_ONLY);
+
+void mal_attach_csr(MalFor& f, void** values, size_t value_elem_size, void** col_indices, size_t index_elem_size, long* row_ptr, long n_rows, long nnz);
+
+void mal_allgather_replicated(MalFor& f, void* full_buf, size_t elem_size, long total_n);
+
+void mal_bcast_impl(void* buf, int count, MPI_Datatype dtype, int root);
+
+void mal_sync_impl(MalFor& f, void* buf, int count, MPI_Datatype dtype, MPI_Op op);
+
+void halo_exchange_field(MalFor& f, void* buf, size_t elem, long total);
+
+void mal_loop_horizon(long steps_remaining);
+
+void mal_step_sync(MalFor& f, void* full_buf, size_t elem_size, long total_n);
+
+void mal_step(MalFor& f, void* full_buf, size_t elem_size, long total_n);
+
 namespace detail {
 
 	struct AccDesc {
@@ -207,29 +224,25 @@ namespace detail {
 
 	void acc_register(MalFor& f, AccDesc d, int result_rank);
 
-	template<typename T>
-	inline void acc_get_t(const void* p, void* d) {
+	template<typename T> inline void acc_get_t(const void* p, void* d) {
 
 		*static_cast<T*>(d) = *static_cast<const T*>(p);
 
 	}
 
-	template<typename T>
-	inline void acc_set_t(void* p, const void* s) {
+	template<typename T> inline void acc_set_t(void* p, const void* s) {
 
 		*static_cast<T*>(p) = *static_cast<const T*>(s);
 
 	}
 
-	template<typename T>
-	inline void acc_add_t(void* p, const void* s) {
+	template<typename T> inline void acc_add_t(void* p, const void* s) {
 
 		*static_cast<T*>(p) += *static_cast<const T*>(s);
 
 	}
 
-	template<typename T>
-	inline void acc_reset_t(void* p) {
+	template<typename T> inline void acc_reset_t(void* p) {
 
 		*static_cast<T*>(p) = T{};
 
@@ -237,30 +250,53 @@ namespace detail {
 
 }
 
-template<typename T>
-inline void mal_attach_acc(MalFor& f, T& acc, MPI_Datatype dtype, MPI_Op op, int result_rank = 0) {
+template<typename T> inline void mal_attach_acc(MalFor& f, T& acc, MPI_Datatype dtype, MPI_Op op, int result_rank = 0) {
 
 	detail::acc_register(f, {
-		&acc, dtype, op, sizeof(T),
-		detail::acc_get_t<T>,
-		detail::acc_set_t<T>,
-		detail::acc_add_t<T>,
-		detail::acc_reset_t<T>,
-	}, result_rank);
+
+		&acc, dtype, op, sizeof(T), detail::acc_get_t<T>, detail::acc_set_t<T>, detail::acc_add_t<T>, detail::acc_reset_t<T>, }, result_rank);
 
 }
 
-template<typename T>
-inline void mal_attach_acc(MalFor& f, T& acc, int result_rank = 0) {
+template<typename T> inline void mal_attach_acc(MalFor& f, T& acc, int result_rank = 0) {
 
 	mal_attach_acc(f, acc, MpiType<T>::value(), MPI_SUM, result_rank);
 
 }
 
-template<typename T>
-inline void mal_attach_acc(MalForND& f, T& acc, int result_rank = 0) {
+template<typename T> inline void mal_attach_acc(MalForND& f, T& acc, int result_rank = 0) {
 
 	mal_attach_acc(mal_for_nd_base(f), acc, result_rank);
+
+}
+
+template<typename T> inline void mal_sync(MalFor& f, T& value, MPI_Op op = MPI_SUM) {
+
+	mal_sync_impl(f, &value, 1, MpiType<T>::value(), op);
+
+}
+
+template<typename T> inline void mal_sync(MalFor& f, T* values, int count, MPI_Op op = MPI_SUM) {
+
+	mal_sync_impl(f, values, count, MpiType<T>::value(), op);
+
+}
+
+template<typename T> inline void mal_sync(MalForND& f, T& value, MPI_Op op = MPI_SUM) {
+
+	mal_sync_impl(mal_for_nd_base(f), &value, 1, MpiType<T>::value(), op);
+
+}
+
+template<typename T> inline void mal_bcast(T& value, int root = 0) {
+
+	mal_bcast_impl(&value, 1, MpiType<T>::value(), root);
+
+}
+
+template<typename T> inline void mal_bcast(T* values, int count, int root = 0) {
+
+	mal_bcast_impl(values, count, MpiType<T>::value(), root);
 
 }
 

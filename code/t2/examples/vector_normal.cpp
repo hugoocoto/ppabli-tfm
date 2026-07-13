@@ -103,7 +103,7 @@ int main(int argc, char* argv[]) {
 
 		#if BENCH_CSV
 
-			print_bench_csv("vector", "normal", use_collapse ? "collapse" : "flat", world_size, total_n, elapsed, errors);
+			print_bench_csv("vector", "normal", use_collapse ? "collapse" : "flat", world_size, world_size, total_n, elapsed, errors);
 
 		#else
 

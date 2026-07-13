@@ -6,8 +6,10 @@
 #include "example_utils.hpp"
 
 struct BlockRange {
+
 	long start;
 	long count;
+
 };
 
 BlockRange block_range(long total, int rank, int size) {
@@ -44,6 +46,7 @@ int main(int argc, char* argv[]) {
 	const double t0 = MPI_Wtime();
 
 	long local_hits = 0;
+
 	for (long i = 0; i < range.count; i++) {
 
 		double x = static_cast<double>(rand_r(&seed)) / RAND_MAX;
@@ -72,7 +75,7 @@ int main(int argc, char* argv[]) {
 
 		#if BENCH_CSV
 
-			print_bench_csv("montecarlo", "normal", "std", world_size, total_points, t1 - t0, 0);
+			print_bench_csv("montecarlo", "normal", "std", world_size, world_size, total_points, t1 - t0, 0);
 
 		#else
 

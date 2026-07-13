@@ -98,7 +98,6 @@ int main(int argc, char* argv[]) {
 
 				continue;
 
-
 			}
 
 			for (long c = 0; c < N; c++) {
@@ -125,7 +124,7 @@ int main(int argc, char* argv[]) {
 
 		#if BENCH_CSV
 
-			print_bench_csv("sparse", "normal", "std", world_size, M, t1 - t0, 0);
+			print_bench_csv("sparse", "normal", "std", world_size, world_size, M, t1 - t0, 0);
 
 		#else
 

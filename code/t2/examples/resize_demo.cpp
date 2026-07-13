@@ -194,7 +194,12 @@ int main(int argc, char* argv[]) {
 
 			if (data[j] != static_cast<float>(j + 1)) {
 
-				if (errors < 20) MAL_LOG(MAL_LOG_INFO, "[DEBUG] data[%ld]=%.1f expected=%.1f", j, data[j], (float)(j+1));
+				if (errors < 20) {
+
+					MAL_LOG(MAL_LOG_INFO, "[DEBUG] data[%ld]=%.1f expected=%.1f", j, data[j], (float)(j+1));
+
+				}
+
 				errors++;
 
 			}
