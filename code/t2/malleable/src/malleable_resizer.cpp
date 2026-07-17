@@ -93,6 +93,7 @@ class Resizer {
 	long my_new_vs_{0};
 	long my_new_count_{0};
 	long confirmed_snapshot_{LONG_MIN};
+	std::vector<long> done_snapshot_;
 
 public:
 
@@ -280,29 +281,68 @@ void Resizer::collect_ranges() {
 	std::vector<long> local;
 	local.reserve(16);
 
-	confirmed_snapshot_ = (g.loop && g.comm.active != MPI_COMM_NULL) ? g.loop->confirmed_iter.load(std::memory_order_acquire) : LONG_MIN;
+	done_snapshot_.clear();
 
-	if (g.loop && g.comm.active != MPI_COMM_NULL) {
+	{
 
-		const long first_s = confirmed_snapshot_ + 1;
-		const long first_e = g.loop->end;
+		std::lock_guard lk(g.sync.plan_mu);
 
-		if (first_s < first_e) {
+		confirmed_snapshot_ = (g.loop && g.comm.active != MPI_COMM_NULL) ? g.loop->confirmed_iter.load(std::memory_order_acquire) : LONG_MIN;
 
-			local.push_back(first_s);
-			local.push_back(first_e);
+		if (g.loop && g.comm.active != MPI_COMM_NULL) {
 
-		}
+			const long first_s = confirmed_snapshot_ + 1;
+			const long first_e = g.loop->end;
 
-		for (size_t ri = g.loop->plan_idx + 1; ri < g.loop->plan_ranges.size(); ri++) {
+			if (first_s < first_e) {
 
-			const long s = g.loop->plan_ranges[ri].first;
-			const long e = g.loop->plan_ranges[ri].second;
+				local.push_back(first_s);
+				local.push_back(first_e);
 
-			if (s < e) {
+			}
 
-				local.push_back(s);
-				local.push_back(e);
+			for (size_t ri = g.loop->plan_idx + 1; ri < g.loop->plan_ranges.size(); ri++) {
+
+				const long s = g.loop->plan_ranges[ri].first;
+				const long e = g.loop->plan_ranges[ri].second;
+
+				if (s < e) {
+
+					local.push_back(s);
+					local.push_back(e);
+
+				}
+
+			}
+
+			done_snapshot_.reserve(g.loop->vecs.size());
+
+			for (MalVec* v : g.loop->vecs) {
+
+				if (v && !v->ragged && v->attach_policy == MAL_ATTACH_PARTITIONED) {
+
+					done_snapshot_.push_back(std::clamp(confirmed_snapshot_ + 1 - v->buf_global_start, 0L, v->local_n));
+
+				} else {
+
+					done_snapshot_.push_back(-1);
+
+				}
+
+			}
+
+			for (MalAcc* a : g.loop->accs) {
+
+				if (a && !a->sealed && a->shadow_iter != LONG_MIN && a->shadow.size() >= a->esz) {
+
+					a->capture.assign(a->shadow.begin(), a->shadow.begin() + (long)a->esz);
+					a->capture_valid = true;
+
+				} else if (a) {
+
+					a->capture_valid = false;
+
+				}
 
 			}
 
@@ -662,9 +702,9 @@ void Resizer::init_vec_tasks(int n, int nvecs, bool was_active) {
 		long old_done = t.v->done_n;
 		long new_done = old_done;
 
-		if (was_active) {
+		if (was_active && vi < (int)done_snapshot_.size() && done_snapshot_[(size_t)vi] >= 0) {
 
-			new_done = std::clamp(confirmed_snapshot_ + 1 - t.v->buf_global_start, 0L, t.v->local_n);
+			new_done = done_snapshot_[(size_t)vi];
 
 		}
 
@@ -1134,7 +1174,7 @@ void Resizer::redistribute_vecs(int n) {
 
 		for (int vi = 0; vi < n; vi++) {
 
-			if (vmeta_[vi].shared_active) {
+			if (vmeta_[vi].shared_active || vmeta_[vi].ragged) {
 
 				continue;
 
@@ -1236,8 +1276,14 @@ void Resizer::reduce_accs(int n) {
 
 			MalAcc* a = (*accs)[(size_t)k];
 
+			if (a->sealed) {
+
+				return;
+
+			}
+
 			a->epoch_buf.assign(r, r + esz);
-			write_identity(static_cast<char*>(a->ptr), a->dtype_idx, a->dop_idx, (int)a->esz);
+			a->needs_reset = true;
 
 		}
 
@@ -1405,7 +1451,34 @@ void resync_ragged_vecs(const std::vector<std::pair<long,long>>& my_ranges) {
 
 }
 
+static void apply_pending_acc_resets() {
+
+	if (g.loop == nullptr) {
+
+		return;
+
+	}
+
+	std::lock_guard lk(g.sync.plan_mu);
+
+	for (MalAcc* a : g.loop->accs) {
+
+		if (a && a->needs_reset) {
+
+			write_identity(static_cast<char*>(a->ptr), a->dtype_idx, a->dop_idx, (int)a->esz);
+			a->shadow_iter = LONG_MIN;
+			a->capture_valid = false;
+			a->needs_reset = false;
+
+		}
+
+	}
+
+}
+
 void Resizer::apply_active() {
+
+	apply_pending_acc_resets();
 
 	if (g.cfg.resize_policy == MAL_RESIZE_POLICY_COST && g.comm.u_rank >= old_a_size_) {
 
@@ -1546,12 +1619,6 @@ void Resizer::apply_active() {
 
 		}
 
-		if (target_ <= old_a_size_) {
-
-			resync_ragged_vecs(assigned);
-
-		}
-
 	} else {
 
 		auto pa = std::make_unique<PendingActivation>();
@@ -1578,6 +1645,8 @@ void Resizer::apply_active() {
 		publish_pending_after_broadcast = true;
 
 	}
+
+	resync_ragged_vecs(publish_pending_after_broadcast ? deferred_pending_ranges : assigned);
 
 	if (target_ > old_a_size_) {
 
@@ -1912,6 +1981,8 @@ void Resizer::broadcast_shared_vecs() {
 }
 
 void Resizer::apply_inactive() {
+
+	apply_pending_acc_resets();
 
 	g.comm.a_rank = -1;
 	g.comm.a_size = 0;
@@ -3114,16 +3185,17 @@ ResizeConsensus unanimous_resize_decision() {
 	const long long local_finalize = g.sync.finalize_requested.load(std::memory_order_acquire) ? 1LL : 0LL;
 	const long long local_done = local_decision.done ? 1LL : 0LL;
 	const long long any_active_flag = is_active ? 1LL : 0LL;
+	const long long local_gen = (long long)g.loop_gen.load(std::memory_order_acquire);
 
 	const long long send_should = is_active ? local_should : 0LL;
 	const long long send_neg_should = is_active ? -local_should : LLONG_MIN / 2;
 	const long long send_target = is_active ? local_target : -1LL;
 	const long long send_neg_target = is_active ? -local_target : LLONG_MIN / 2;
 
-	long long reduce_in[8] = {send_should, send_target, send_neg_should, send_neg_target, local_active, local_finalize, local_done, any_active_flag};
-	long long reduce_out[8] = {};
+	long long reduce_in[10] = {send_should, send_target, send_neg_should, send_neg_target, local_active, local_finalize, local_done, any_active_flag, local_gen, -local_gen};
+	long long reduce_out[10] = {};
 
-	MPI_Allreduce(reduce_in, reduce_out, 8, MPI_LONG_LONG, MPI_MAX, g.comm.universe);
+	MPI_Allreduce(reduce_in, reduce_out, 10, MPI_LONG_LONG, MPI_MAX, g.comm.universe);
 
 	const long long max_should = reduce_out[0];
 	const long long max_target = reduce_out[1];
@@ -3132,10 +3204,29 @@ ResizeConsensus unanimous_resize_decision() {
 	const long long any_finalize = reduce_out[5];
 	const long long any_done = reduce_out[6];
 	const bool any_active_voted = (reduce_out[7] != 0);
+	const long long max_gen = reduce_out[8];
+	const long long min_gen = -reduce_out[9];
 
-	if (any_finalize || any_done) {
+	if (any_finalize) {
 
 		g.sync.stop.store(true, std::memory_order_release);
+		g.sync.notify();
+		out.unanimous = true;
+		out.should_resize = false;
+		out.target = -1;
+		out.active_size = (int)reduce_out[4];
+		return out;
+
+	}
+
+	if (any_done || min_gen != max_gen) {
+
+		if (any_done && min_gen == max_gen && max_gen > 0) {
+
+			g.sync.loop_done_gen.store((unsigned long long)max_gen, std::memory_order_release);
+
+		}
+
 		g.sync.notify();
 		out.unanimous = true;
 		out.should_resize = false;
@@ -3294,6 +3385,8 @@ inline int effective_epoch_interval_ms() {
 
 }
 
+static void worker_self_sample();
+
 inline bool process_step_request(std::chrono::steady_clock::time_point& next_step_decision, const std::chrono::steady_clock::time_point& start_tp, bool needs_initial_rampup) {
 
 	if (!g.sync.step_request.load(std::memory_order_acquire)) {
@@ -3348,6 +3441,7 @@ inline bool process_step_request(std::chrono::steady_clock::time_point& next_ste
 	} else if (do_eval) {
 
 		committed = prepare_resize_if_needed();
+		worker_self_sample();
 
 		if (g.comm.u_rank == 0) {
 
@@ -3437,7 +3531,49 @@ inline bool process_step_request(std::chrono::steady_clock::time_point& next_ste
 
 }
 
+static void worker_self_sample() {
+
+	#ifdef __linux__
+
+		struct timespec ts;
+
+		if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
+
+			g.worker_cpu_ns.store((long long)ts.tv_sec * 1000000000LL + ts.tv_nsec, std::memory_order_release);
+
+		}
+
+		FILE* f = std::fopen("/proc/thread-self/schedstat", "r");
+
+		if (f != nullptr) {
+
+			unsigned long long on_cpu = 0, run_delay = 0;
+
+			if (std::fscanf(f, "%llu %llu", &on_cpu, &run_delay) == 2) {
+
+				g.worker_runq_ns.store((long long)run_delay, std::memory_order_release);
+
+			}
+
+			std::fclose(f);
+
+		}
+
+		g.worker_last_cpu.store(sched_getcpu(), std::memory_order_release);
+
+	#endif
+
+}
+
 void progress_thread() {
+
+	#ifdef __linux__
+
+		g.worker_tid.store((long)syscall(SYS_gettid), std::memory_order_release);
+
+	#endif
+
+	worker_self_sample();
 
 	#ifdef __APPLE__
 
@@ -3474,6 +3610,8 @@ void progress_thread() {
 	const bool worker_immutable = !g.cfg.malleability_enabled.load(std::memory_order_relaxed) || (!g.cfg.enabled.load(std::memory_order_relaxed) && !g.cfg.load_balancing_enabled.load(std::memory_order_relaxed));
 
 	while (!g.sync.stop.load(std::memory_order_relaxed)) {
+
+		worker_self_sample();
 
 		if (g.sync.attach_pending.load(std::memory_order_acquire)) {
 
@@ -3622,6 +3760,8 @@ void progress_thread() {
 
 			(void)prepare_resize_if_needed();
 
+			worker_self_sample();
+
 			next_resize_check = now + std::chrono::milliseconds(epoch_ms);
 
 		}
@@ -3636,6 +3776,7 @@ void progress_thread() {
 
 	}
 
+	worker_self_sample();
 	g.sync.notify();
 
 }

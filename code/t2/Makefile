@@ -8,7 +8,7 @@ TEST_RUNS ?= 10
 NORM_N ?= 4000
 
 USE_PAPI ?= 0
-PAPI_PREFIX ?= $(HOME)/Desktop/papi/src/install
+PAPI_PREFIX ?=
 
 CXXFLAGS = -O2 -march=native -Wall -std=c++20 -Imalleable/include -DBENCH_CSV=$(BENCH_CSV)
 LIBS = -lpthread
@@ -33,8 +33,28 @@ export MAL_LOG_ALL_RANKS=1
 
 ifeq ($(USE_PAPI), 1)
 
-	CXXFLAGS += -DMAL_USE_PAPI -I$(PAPI_PREFIX)/include
-	LIBS += -L$(PAPI_PREFIX)/lib -lpapi
+	CXXFLAGS += -DMAL_USE_PAPI
+
+	ifneq ($(strip $(PAPI_PREFIX)),)
+
+		CXXFLAGS += -I$(PAPI_PREFIX)/include
+		LIBS += -L$(PAPI_PREFIX)/lib -Wl,-rpath,$(PAPI_PREFIX)/lib
+
+	endif
+
+	ifneq ($(strip $(PFM_PREFIX)),)
+
+		LIBS += -L$(PFM_PREFIX)/lib -Wl,-rpath,$(PFM_PREFIX)/lib
+
+	endif
+
+	LIBS += -lpapi
+
+	ifneq ($(strip $(PFM_PREFIX)),)
+
+		LIBS += -lpfm
+
+	endif
 
 endif
 
@@ -80,6 +100,18 @@ TARGET_SPMV_CSR = $(BUILD_DIR)/spmv_csr
 SRCS_SPMV_CSR = examples/spmv_csr.cpp
 OBJS_SPMV_CSR = $(SRCS_SPMV_CSR:%.cpp=$(BUILD_DIR)/%.o)
 
+TARGET_NOISE = $(BUILD_DIR)/noise_bench
+SRCS_NOISE = examples/noise_bench.cpp
+OBJS_NOISE = $(SRCS_NOISE:%.cpp=$(BUILD_DIR)/%.o)
+
+TARGET_NOISE_NORMAL = $(BUILD_DIR)/noise_bench_normal
+SRCS_NOISE_NORMAL = examples/noise_bench_normal.cpp
+OBJS_NOISE_NORMAL = $(SRCS_NOISE_NORMAL:%.cpp=$(BUILD_DIR)/%.o)
+
+TARGET_NOISE_DAEMON = $(BUILD_DIR)/noise_daemon
+SRCS_NOISE_DAEMON = examples/noise_daemon.cpp
+OBJS_NOISE_DAEMON = $(SRCS_NOISE_DAEMON:%.cpp=$(BUILD_DIR)/%.o)
+
 TARGET_SPMV_NORMAL = $(BUILD_DIR)/spmv_imbal_normal
 SRCS_SPMV_NORMAL = examples/spmv_imbal_normal.cpp
 OBJS_SPMV_NORMAL = $(SRCS_SPMV_NORMAL:%.cpp=$(BUILD_DIR)/%.o)
@@ -124,7 +156,7 @@ DEPS =$(LIB_OBJS:.o=.d) $(OBJS_MC:.o=.d) $(OBJS_VEC:.o=.d) $(OBJS_MAT:.o=.d) $(O
 
 .PHONY: all run_montecarlo run_vector run_vector_collapse run_normalize run_normalize_normal run_matmat run_matvec run_sparse run_resize_demo run_resize_demo_dynamic run_life_dynamic run_spmv_imbal run_spmv_csr run_spmv_imbal_normal run_montecarlo_normal run_vector_normal run_vector_normal_collapse run_matmat_normal run_matvec_normal run_sparse_normal test clean re
 
-all: $(LIB_MAL) $(TARGET_MC) $(TARGET_VEC) $(TARGET_MAT) $(TARGET_MV) $(TARGET_SP) $(TARGET_RD) $(TARGET_LD) $(TARGET_SPMV) $(TARGET_SPMV_NORMAL) $(TARGET_MC_NORMAL) $(TARGET_VEC_NORMAL) $(TARGET_MM_NORMAL) $(TARGET_MV_NORMAL) $(TARGET_SP_NORMAL) $(TARGET_HEAT_NORMAL) $(TARGET_HEAT) $(TARGET_NORM) $(TARGET_NORM_NORMAL) $(TARGET_SPMV_CSR)
+all: $(LIB_MAL) $(TARGET_MC) $(TARGET_VEC) $(TARGET_MAT) $(TARGET_MV) $(TARGET_SP) $(TARGET_RD) $(TARGET_LD) $(TARGET_SPMV) $(TARGET_SPMV_NORMAL) $(TARGET_MC_NORMAL) $(TARGET_VEC_NORMAL) $(TARGET_MM_NORMAL) $(TARGET_MV_NORMAL) $(TARGET_SP_NORMAL) $(TARGET_HEAT_NORMAL) $(TARGET_HEAT) $(TARGET_NORM) $(TARGET_NORM_NORMAL) $(TARGET_SPMV_CSR) $(TARGET_NOISE) $(TARGET_NOISE_NORMAL) $(TARGET_NOISE_DAEMON)
 
 $(LIB_MAL): Makefile $(LIB_OBJS)
 	@mkdir -p $(dir $@)
@@ -157,6 +189,15 @@ $(TARGET_SPMV): $(LIB_MAL) $(OBJS_SPMV)
 
 $(TARGET_SPMV_CSR): $(LIB_MAL) $(OBJS_SPMV_CSR)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_SPMV_CSR) $(LIB_MAL) $(LIBS)
+
+$(TARGET_NOISE): $(LIB_MAL) $(OBJS_NOISE)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_NOISE) $(LIB_MAL) $(LIBS)
+
+$(TARGET_NOISE_NORMAL): $(OBJS_NOISE_NORMAL)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_NOISE_NORMAL) $(LIBS)
+
+$(TARGET_NOISE_DAEMON): $(OBJS_NOISE_DAEMON)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_NOISE_DAEMON) $(LIBS)
 
 $(TARGET_SPMV_NORMAL): $(OBJS_SPMV_NORMAL)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_SPMV_NORMAL) $(LIBS)
@@ -204,7 +245,7 @@ run_vector_collapse: $(TARGET_VEC)
 	$(TRANSPARENT) $(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_VEC) collapse
 
 run_normalize: $(TARGET_NORM)
-	$(TRANSPARENT) $(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_NORM) --n=$(NORM_N)
+	MAL_MALLEABILITY_ENABLED=1 MAL_RESIZE_ENABLED=1 MAL_LOAD_BALANCING_ENABLED=0 MAL_START_AT_UNIVERSE=1 MAL_INITIAL_SIZE=$(NP) MAL_AFFINITY=0 $(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_NORM) --n=$(NORM_N)
 
 run_normalize_normal: $(TARGET_NORM_NORMAL)
 	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_NORM_NORMAL) --n=$(NORM_N)
@@ -250,12 +291,12 @@ else
 endif
 	SPMV_ARGS = $(SPMV_SRC_ARGS) --reps=$(SPMV_REPS)
 
-SPMV_MAL_ENV = MAL_MALLEABILITY_ENABLED=1 MAL_RESIZE_ENABLED=1 MAL_LOAD_BALANCING_ENABLED=1 MAL_RESIZE_POLICY=balance MAL_INITIAL_SIZE=$(NP) MAL_AFFINITY=0 MAL_EPOCH_INTERVAL_MS=50 MAL_EPOCH_CHANGE_MODE=1
+SPMV_MAL_ENV = MAL_MALLEABILITY_ENABLED=1 MAL_RESIZE_ENABLED=1 MAL_LOAD_BALANCING_ENABLED=1 MAL_START_AT_UNIVERSE=1 MAL_INITIAL_SIZE=$(NP) MAL_AFFINITY=0 MAL_EPOCH_INTERVAL_MS=50 MAL_EPOCH_CHANGE_MODE=1
 
 run_spmv_imbal: $(TARGET_SPMV)
 	$(SPMV_MAL_ENV) $(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_SPMV) $(SPMV_ARGS)
 
-SPMV_CSR_ENV = MAL_MALLEABILITY_ENABLED=1 MAL_RESIZE_ENABLED=0 MAL_LOAD_BALANCING_ENABLED=1 MAL_START_AT_UNIVERSE=1 MAL_INITIAL_SIZE=$(NP) MAL_AFFINITY=0 MAL_EPOCH_INTERVAL_MS=60
+SPMV_CSR_ENV = MAL_MALLEABILITY_ENABLED=1 MAL_RESIZE_ENABLED=1 MAL_LOAD_BALANCING_ENABLED=1 MAL_START_AT_UNIVERSE=1 MAL_INITIAL_SIZE=$(NP) MAL_AFFINITY=0 MAL_EPOCH_INTERVAL_MS=60
 
 run_spmv_csr: $(TARGET_SPMV_CSR)
 	$(SPMV_CSR_ENV) $(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_SPMV_CSR) $(SPMV_ARGS)

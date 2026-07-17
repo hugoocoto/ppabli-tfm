@@ -28,6 +28,8 @@ int main(int argc, char* argv[]) {
 	long i1, lim1;
 	MalFor f1 = mal_for(N, i1, lim1);
 
+	mal_attach_acc(f1, sum_sq);
+
 	for (; i1 < lim1; i1++) {
 
 		sum_sq += x[(size_t)i1] * x[(size_t)i1];

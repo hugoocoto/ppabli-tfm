@@ -20,11 +20,19 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <ctime>
 #include <pthread.h>
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
+
+#ifdef __linux__
+
+	#include <sched.h>
+	#include <sys/syscall.h>
+
+#endif
 
 #ifdef __linux__
 
@@ -329,6 +337,12 @@ struct MalAcc {
 	size_t esz{sizeof(long)};
 
 	std::vector<char> epoch_buf;
+	std::vector<char> shadow;
+	std::vector<char> capture;
+	long shadow_iter{LONG_MIN};
+	bool capture_valid{false};
+	bool needs_reset{false};
+	bool sealed{false};
 
 	int result_rank{0};
 	int dtype_idx{1};
@@ -396,6 +410,7 @@ struct MalState {
 		MPI_Session session{MPI_SESSION_NULL};
 		MPI_Group world_group{MPI_GROUP_NULL};
 		MPI_Comm universe{MPI_COMM_NULL};
+		MPI_Comm app_universe{MPI_COMM_NULL};
 		int u_rank{-1};
 		int u_size{0};
 		MPI_Comm active{MPI_COMM_NULL};
@@ -435,6 +450,7 @@ struct MalState {
 		int main_core{kDefaultMainCore};
 		int worker_core{kDefaultWorkerCore};
 		int resolved_main_core{-1};
+		int resolved_worker_core{-1};
 		int node_local_rank{0};
 		int initial_size{kDefaultInitialSize};
 
@@ -442,6 +458,8 @@ struct MalState {
 
 	struct SyncBarrier {
 
+		alignas(64) std::mutex plan_mu;
+		alignas(64) std::atomic<unsigned long long> loop_done_gen{0};
 		alignas(64) std::atomic<bool> compute_ready{false};
 		alignas(64) std::atomic<bool> resize_pending{false};
 		alignas(64) std::atomic<bool> attach_pending{false};
@@ -605,6 +623,11 @@ struct MalState {
 	std::unique_ptr<PendingActivation> pending;
 
 	std::thread worker;
+	std::atomic<long> worker_tid{-1};
+	std::atomic<unsigned long long> loop_gen{0};
+	std::atomic<long long> worker_cpu_ns{-1};
+	std::atomic<long long> worker_runq_ns{-1};
+	std::atomic<int> worker_last_cpu{-1};
 
 	struct Timing {
 
@@ -638,19 +661,22 @@ struct MalState {
 
 static MalState g;
 
+static void seal_loop_vecs(MalFor& prev);
+
 MalFor::~MalFor() {
 
 	phase.store(MAL_LOOP_FINISHED, std::memory_order_release);
 
 	if (g.loop == this) {
 
+		seal_loop_vecs(*this);
 		g.loop = nullptr;
 
 	}
 
 }
 
-MalFor::MalFor(MalFor&& other) noexcept : start(other.start), end(other.end), current(other.current), user_iter(other.user_iter), user_limit(other.user_limit), plan_idx(other.plan_idx), check_counter(other.check_counter), plan_ranges(std::move(other.plan_ranges)), plan_local_bases(std::move(other.plan_local_bases)), vecs(std::move(other.vecs)), accs(std::move(other.accs)) {
+MalFor::MalFor(MalFor&& other) noexcept : start(other.start), end(other.end), current(other.current), user_iter(other.user_iter), user_limit(other.user_limit), plan_idx(other.plan_idx), check_counter(other.check_counter), gen(other.gen), plan_ranges(std::move(other.plan_ranges)), plan_local_bases(std::move(other.plan_local_bases)), vecs(std::move(other.vecs)), accs(std::move(other.accs)) {
 
 	phase.store(other.phase.load(std::memory_order_relaxed), std::memory_order_relaxed);
 	confirmed_iter.store(other.confirmed_iter.load(std::memory_order_relaxed), std::memory_order_relaxed);
@@ -905,7 +931,7 @@ static int detect_node_local_rank(int fallback_rank) {
 
 	}
 
-	static void linux_pin_thread(pthread_t pt, int core_id, const char* label) noexcept {
+	static bool linux_pin_thread(pthread_t pt, int core_id, const char* label) noexcept {
 
 		cpu_set_t cpuset;
 		CPU_ZERO(&cpuset);
@@ -917,15 +943,17 @@ static int detect_node_local_rank(int fallback_rank) {
 
 			MAL_LOG_L(MAL_LOG_WARN, "AFFINITY", "%s: failed to pin to core %d (err=%d)", label, core_id, rc);
 
-		} else {
-
-			MAL_LOG_L(MAL_LOG_DEBUG, "AFFINITY", "%s: pinned to core %d", label, core_id);
+			return false;
 
 		}
 
+		MAL_LOG_L(MAL_LOG_DEBUG, "AFFINITY", "%s: pinned to core %d", label, core_id);
+
+		return true;
+
 	}
 
-	static void linux_pin(pthread_t pt, bool want_pcore, int core_cfg, const char* label, int exclude_core = -1) noexcept {
+	static int linux_pin(pthread_t pt, bool want_pcore, int core_cfg, const char* label, int exclude_core = -1) noexcept {
 
 		int core_id = core_cfg;
 
@@ -941,7 +969,7 @@ static int detect_node_local_rank(int fallback_rank) {
 
 				MAL_LOG_L(MAL_LOG_DEBUG, "AFFINITY", "%s: no %s core found, not pinning", label, want_pcore ? "P-core" : "E-core");
 
-				return;
+				return -1;
 
 			}
 
@@ -951,7 +979,7 @@ static int detect_node_local_rank(int fallback_rank) {
 
 				MAL_LOG_L(MAL_LOG_WARN, "AFFINITY", "%s: configured core %d is outside the allowed cpuset (resource manager / launcher binding), not pinning", label, core_id);
 
-				return;
+				return -1;
 
 			}
 
@@ -959,7 +987,7 @@ static int detect_node_local_rank(int fallback_rank) {
 
 		}
 
-		linux_pin_thread(pt, core_id, label);
+		return linux_pin_thread(pt, core_id, label) ? core_id : -1;
 
 	}
 
@@ -1008,21 +1036,7 @@ void pin_main_thread_to_pcore() noexcept {
 
 	#ifdef __linux__
 
-		int core_id = g.cfg.main_core;
-
-		if (core_id < 0) {
-
-			if (auto core = linux_pick_core(true)) {
-
-				core_id = *core;
-
-			}
-
-		}
-
-		g.cfg.resolved_main_core = core_id;
-
-		linux_pin(pthread_self(), true, g.cfg.main_core, "main");
+		g.cfg.resolved_main_core = linux_pin(pthread_self(), true, g.cfg.main_core, "main");
 
 	#endif
 
@@ -1046,7 +1060,7 @@ void pin_worker_thread_to_ecore(std::thread& t) noexcept {
 
 	#ifdef __linux__
 
-		linux_pin(t.native_handle(), false, g.cfg.worker_core, "worker", g.cfg.resolved_main_core);
+		g.cfg.resolved_worker_core = linux_pin(t.native_handle(), false, g.cfg.worker_core, "worker", g.cfg.resolved_main_core);
 
 	#endif
 
@@ -1068,6 +1082,57 @@ int mal_rank() {
 int mal_size() {
 
 	return g.comm.u_size;
+
+}
+
+long mal_worker_tid() {
+
+	return g.worker_tid.load(std::memory_order_acquire);
+
+}
+
+int mal_worker_core() {
+
+	if (g.cfg.resolved_worker_core >= 0) {
+
+		return g.cfg.resolved_worker_core;
+
+	}
+
+	return g.worker_last_cpu.load(std::memory_order_acquire);
+
+}
+
+double mal_worker_cpu_seconds() {
+
+	#ifdef __linux__
+
+		if (g.worker.joinable()) {
+
+			clockid_t cid;
+			struct timespec ts;
+
+			if (pthread_getcpuclockid(g.worker.native_handle(), &cid) == 0 && clock_gettime(cid, &ts) == 0) {
+
+				return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+
+			}
+
+		}
+
+	#endif
+
+	const long long ns = g.worker_cpu_ns.load(std::memory_order_acquire);
+
+	return ns >= 0 ? (double)ns * 1e-9 : -1.0;
+
+}
+
+double mal_worker_runq_seconds() {
+
+	const long long ns = g.worker_runq_ns.load(std::memory_order_acquire);
+
+	return ns >= 0 ? (double)ns * 1e-9 : -1.0;
 
 }
 
@@ -1927,6 +1992,8 @@ void load_pending_ranges_into_loop(MalFor& f) {
 
 	}
 
+	std::lock_guard lk(g.sync.plan_mu);
+
 	install_loop_plan(f, g.pending->ranges);
 
 	g.pending->ranges.clear();
@@ -2003,24 +2070,42 @@ template<typename GetAcc, typename OnResult> void batched_allreduce(int n, GetAc
 		tl_send.resize(total);
 		tl_recv.resize(total);
 
-		for (int k = ai; k < ae; k++) {
+		{
 
-			char* slot = tl_send.data() + (k - ai) * esz;
-			MalAcc* a = get_acc(k);
+			std::lock_guard lk(g.sync.plan_mu);
 
-			if (a) {
+			for (int k = ai; k < ae; k++) {
 
-				a->fn_get(a->ptr, slot);
+				char* slot = tl_send.data() + (k - ai) * esz;
+				MalAcc* a = get_acc(k);
 
-				if (g.comm.u_rank == 0 && !a->epoch_buf.empty()) {
+				if (a && !a->sealed) {
 
-					combine_with_op(slot, a->epoch_buf.data(), a->dtype_idx, a->dop_idx);
+					if (a->capture_valid && a->capture.size() >= (size_t)esz) {
+
+						std::memcpy(slot, a->capture.data(), (size_t)esz);
+
+					} else if (a->shadow_iter != LONG_MIN && a->shadow.size() >= (size_t)esz) {
+
+						std::memcpy(slot, a->shadow.data(), (size_t)esz);
+
+					} else {
+
+						write_identity(slot, meta[ai].dt, meta[ai].dp, esz);
+
+					}
+
+					if (g.comm.u_rank == 0 && !a->epoch_buf.empty()) {
+
+						combine_with_op(slot, a->epoch_buf.data(), a->dtype_idx, a->dop_idx);
+
+					}
+
+				} else {
+
+					write_identity(slot, meta[ai].dt, meta[ai].dp, esz);
 
 				}
-
-			} else {
-
-				write_identity(slot, meta[ai].dt, meta[ai].dp, esz);
 
 			}
 

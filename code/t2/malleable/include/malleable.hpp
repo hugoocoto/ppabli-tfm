@@ -18,6 +18,10 @@ int mal_rank();
 int mal_size();
 int mal_active_size();
 double mal_t_origin();
+long mal_worker_tid();
+int mal_worker_core();
+double mal_worker_cpu_seconds();
+double mal_worker_runq_seconds();
 
 enum MalLogLevel {
 
@@ -84,6 +88,7 @@ struct alignas(64) MalFor {
 	std::atomic<long> confirmed_iter{LONG_MIN};
 	size_t plan_idx{0};
 	size_t check_counter{0};
+	unsigned long long gen{0};
 
 	std::vector<std::pair<long,long>> plan_ranges;
 	std::vector<long> plan_local_bases;
@@ -302,3 +307,15 @@ template<typename T> inline void mal_bcast(T* values, int count, int root = 0) {
 
 void mal_attach_mat(MalFor& f, void** user_ptr, size_t elem_size, long primary_n, long secondary_n, int result_rank = -1, MalAttachPolicy policy = MAL_ATTACH_PARTITIONED, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT, MalDataAccessMode access_mode = MAL_ACCESS_READ_WRITE);
 void mal_attach_mat(MalForND& f, void** user_ptr, size_t elem_size, long primary_n, long secondary_n, int result_rank = -1, MalAttachPolicy policy = MAL_ATTACH_PARTITIONED, MalAttachExecMode exec_mode = MAL_ATTACH_INHERIT, MalDataAccessMode access_mode = MAL_ACCESS_READ_WRITE);
+
+constexpr int kNumPapiEvents = 4;
+
+void papi_init();
+void papi_finalize();
+bool papi_is_available();
+bool papi_accum_epoch(long long out[kNumPapiEvents]);
+void papi_rotate_epoch(long long prev_buf[kNumPapiEvents]);
+double papi_ipc(const long long vals[kNumPapiEvents]);
+double papi_mem_bound_fraction(const long long vals[kNumPapiEvents]);
+double papi_energy_nJ(const long long vals[kNumPapiEvents]);
+double papi_energy_per_iter(const long long vals[kNumPapiEvents], long done);

@@ -47,8 +47,6 @@
 
 #endif
 
-constexpr int kNumPapiEvents = 4;
-
 constexpr double kRefFreqHz = MAL_PAPI_REF_FREQ_HZ;
 constexpr double kStaticW = MAL_PAPI_STATIC_W;
 constexpr double kDynNJPerCyc = MAL_PAPI_DYN_NJ_PER_CYC;
@@ -192,17 +190,23 @@ inline void papi_load_env_overrides() {
 
 #else
 
-	inline void papi_init() {}
-	inline void papi_finalize() {}
+	void papi_init() {
 
-	inline bool papi_accum_epoch(long long out[kNumPapiEvents]) {
+		papi_load_env_overrides();
+
+	}
+
+	void papi_finalize() {}
+
+	bool papi_accum_epoch(long long out[kNumPapiEvents]) {
 
 		(void)out;
+
 		return false;
 
 	}
 
-	inline bool papi_is_available() {
+	bool papi_is_available() {
 
 		return false;
 

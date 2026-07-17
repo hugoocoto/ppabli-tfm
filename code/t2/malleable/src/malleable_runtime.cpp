@@ -751,6 +751,15 @@ void mal_init(MalResizePolicy policy) {
 
 	}
 
+	rc = MPI_Comm_dup(g.comm.universe, &g.comm.app_universe);
+
+	if (rc != MPI_SUCCESS || g.comm.app_universe == MPI_COMM_NULL) {
+
+		log_mpi_error("MPI_Comm_dup(app_universe)", rc);
+		std::abort();
+
+	}
+
 	rc = MPI_Comm_set_errhandler(g.comm.universe, MPI_ERRORS_RETURN);
 
 	if (rc != MPI_SUCCESS) {
@@ -813,6 +822,12 @@ void mal_init(MalResizePolicy policy) {
 	}
 
 	g.worker = std::thread(progress_thread);
+
+	#if defined(__linux__)
+
+		pthread_setname_np(g.worker.native_handle(), "mal_worker");
+
+	#endif
 
 	#if defined(__linux__) || defined(__APPLE__)
 
@@ -1155,9 +1170,41 @@ void mal_allgather_replicated(MalFor& f, void* full_buf, size_t elem_size, long 
 
 void mal_sync_impl(MalFor& f, void* buf, int count, MPI_Datatype dtype, MPI_Op op) {
 
-	(void)f;
+	if (count <= 0) {
 
-	if (g.comm.active == MPI_COMM_NULL || g.comm.a_size <= 1 || count <= 0) {
+		return;
+
+	}
+
+	if (count == 1) {
+
+		for (MalAcc* a : f.accs) {
+
+			if (a && a->ptr == buf && !a->sealed) {
+
+				if (g.comm.app_universe != MPI_COMM_NULL && g.comm.u_size > 1) {
+
+					int rc = MPI_Allreduce(MPI_IN_PLACE, buf, 1, dtype, op, g.comm.app_universe);
+					log_mpi_error("MPI_Allreduce(mal_sync acc)", rc);
+
+				}
+
+				if (!a->epoch_buf.empty()) {
+
+					combine_with_op(buf, a->epoch_buf.data(), a->dtype_idx, a->dop_idx);
+
+				}
+
+				a->sealed = true;
+				return;
+
+			}
+
+		}
+
+	}
+
+	if (g.comm.active == MPI_COMM_NULL || g.comm.a_size <= 1) {
 
 		return;
 
@@ -1503,7 +1550,7 @@ void mal_finalize() {
 
 			MalAcc* a = g.accs[(size_t)k].get();
 
-			if (!a || !a->ptr) {
+			if (!a || !a->ptr || a->sealed) {
 
 				return;
 
@@ -1571,6 +1618,10 @@ void mal_finalize() {
 	rc = MPI_Group_free(&g.comm.world_group);
 	log_mpi_error("MPI_Group_free(world_group)", rc);
 	g.comm.world_group = MPI_GROUP_NULL;
+
+	rc = MPI_Comm_free(&g.comm.app_universe);
+	log_mpi_error("MPI_Comm_free(app_universe)", rc);
+	g.comm.app_universe = MPI_COMM_NULL;
 
 	rc = MPI_Comm_free(&g.comm.universe);
 	log_mpi_error("MPI_Comm_free(universe)", rc);
@@ -1668,6 +1719,7 @@ MalFor mal_for(long total_iters, long& iter, long& limit) {
 
 	f.user_iter = &iter;
 	f.user_limit = &limit;
+	f.gen = g.loop_gen.fetch_add(1, std::memory_order_acq_rel) + 1;
 
 	if (g.loop != nullptr && g.loop != &f) {
 
@@ -1739,13 +1791,17 @@ MalFor mal_for(long total_iters, long& iter, long& limit) {
 
 	const bool skip_idle_activation_wait = (f.start == f.end) && !g.sync.pending_has_ranges.load(std::memory_order_acquire) && (iterative_loop || total_iters <= g.comm.a_size);
 
-	while (!skip_idle_activation_wait && f.start == f.end && !g.sync.stop.load(std::memory_order_acquire)) {
+	while (!skip_idle_activation_wait && f.start == f.end && !g.sync.stop.load(std::memory_order_acquire) && g.sync.loop_done_gen.load(std::memory_order_acquire) < f.gen) {
 
 		f.current = f.end;
 		f.phase.store(MAL_LOOP_WAITING_ACTIVATION, std::memory_order_relaxed);
-		g.sync.compute_wait(has_work_or_stop);
+		g.sync.compute_wait([&f] {
 
-		if (g.sync.stop.load(std::memory_order_acquire)) {
+			return g.sync.stop.load(std::memory_order_acquire) || g.sync.pending_has_ranges.load(std::memory_order_acquire) || g.sync.loop_has_new_work.load(std::memory_order_acquire) || g.sync.loop_done_gen.load(std::memory_order_acquire) >= f.gen;
+
+		});
+
+		if (g.sync.stop.load(std::memory_order_acquire) || g.sync.loop_done_gen.load(std::memory_order_acquire) >= f.gen) {
 
 			break;
 
@@ -1770,16 +1826,25 @@ MalFor mal_for(long total_iters, long& iter, long& limit) {
 
 void advance_next_range(MalFor& f) {
 
-	f.plan_idx++;
-	auto [a, b] = f.plan_ranges[f.plan_idx];
+	long a, b;
 
-	f.start = a;
+	{
 
-	sync_vec_mapping_for_current_range(f);
+		std::lock_guard lk(g.sync.plan_mu);
 
-	set_limit(f, b);
+		f.plan_idx++;
+		a = f.plan_ranges[f.plan_idx].first;
+		b = f.plan_ranges[f.plan_idx].second;
 
-	prime_range_start(f);
+		f.start = a;
+
+		sync_vec_mapping_for_current_range(f);
+
+		set_limit(f, b);
+
+		prime_range_start(f);
+
+	}
 
 	MAL_LOG_L(MAL_LOG_DEBUG, "RANGE", "Next range [%ld, %ld) (base=%ld)", a, b, current_range_local_base(f));
 
@@ -1794,7 +1859,38 @@ void mal_check_for(MalFor& f) {
 	struct ConfirmedExitGuard {
 
 		MalFor* f;
-		~ConfirmedExitGuard() { f->confirmed_iter.store(*f->user_iter, std::memory_order_release); }
+
+		~ConfirmedExitGuard() {
+
+			if (!f->accs.empty()) {
+
+				std::lock_guard lk(g.sync.plan_mu);
+
+				for (MalAcc* a : f->accs) {
+
+					if (a && !a->sealed) {
+
+						if (a->shadow.size() < a->esz) {
+
+							a->shadow.resize(a->esz);
+
+						}
+
+						a->fn_get(a->ptr, a->shadow.data());
+						a->shadow_iter = *f->user_iter;
+
+					}
+
+				}
+
+				f->confirmed_iter.store(*f->user_iter, std::memory_order_release);
+				return;
+
+			}
+
+			f->confirmed_iter.store(*f->user_iter, std::memory_order_release);
+
+		}
 
 	} confirmed_guard{&f};
 
@@ -1902,6 +1998,12 @@ void mal_check_for(MalFor& f) {
 
 	while (!g.sync.stop.load(std::memory_order_acquire)) {
 
+		if (g.sync.loop_done_gen.load(std::memory_order_acquire) >= f.gen) {
+
+			break;
+
+		}
+
 		const bool has_pending = g.sync.pending_has_ranges.load(std::memory_order_acquire);
 		const bool has_resize_pending = g.sync.resize_pending.load(std::memory_order_acquire);
 		const bool has_attach = g.sync.attach_pending.load(std::memory_order_acquire);
@@ -1918,7 +2020,7 @@ void mal_check_for(MalFor& f) {
 			const double t1 = timing_enabled ? MPI_Wtime() : 0.0;
 			g.sync.compute_wait([&] {
 
-				return g.sync.stop.load(std::memory_order_acquire) || g.sync.resize_pending.load(std::memory_order_acquire) || g.sync.pending_has_ranges.load(std::memory_order_acquire) || g.sync.loop_has_new_work.load(std::memory_order_acquire);
+				return g.sync.stop.load(std::memory_order_acquire) || g.sync.resize_pending.load(std::memory_order_acquire) || g.sync.pending_has_ranges.load(std::memory_order_acquire) || g.sync.loop_has_new_work.load(std::memory_order_acquire) || g.sync.loop_done_gen.load(std::memory_order_acquire) >= f.gen;
 
 			});
 
