@@ -7,7 +7,6 @@
 #include <atomic>
 #include <bit>
 #include <cfloat>
-#include <chrono>
 #include <climits>
 #include <cmath>
 #include <condition_variable>
@@ -446,6 +445,7 @@ struct MalState {
 
 		std::atomic<int> cost_sample_meas{3};
 
+		bool trace_enabled {false};
 		bool affinity_enabled{kDefaultAffinityEnabled};
 		int main_core{kDefaultMainCore};
 		int worker_core{kDefaultWorkerCore};
@@ -1174,10 +1174,79 @@ const char* mal_log_level_name(MalLogLevel level) {
 		case MAL_LOG_INFO: return "INFO";
 		case MAL_LOG_WARN: return "WARN";
 		case MAL_LOG_ERROR: return "ERROR";
+		case MAL_LOG_NONE: return "NONE";
 
 	}
 
 	return "INFO";
+
+}
+
+bool mal_should_trace() {
+
+	return g.cfg.trace_enabled;
+
+}
+
+void mal_trace_start() {
+
+	if (mal_should_trace())
+		std::printf("START,%d,%.9f\n", mal_rank(), MPI_Wtime() - mal_t_origin());
+
+}
+
+void mal_trace_end() {
+
+	if (mal_should_trace()) {
+
+		std::printf("END,%d,%.9f\n", mal_rank(), MPI_Wtime() - mal_t_origin());
+		std::fflush(stdout);
+
+	}
+
+}
+
+void mal_trace_timer(int rank, const char* name, double seconds) {
+
+	if (mal_should_trace())
+		std::printf("TIMING,%d,%.9f,%s,%.9f\n", rank, MPI_Wtime() - mal_t_origin(), name, seconds);
+
+}
+
+void mal_trace_resize(long epoch, int old_active, int new_active) {
+
+	if (mal_should_trace())
+		std::printf("RESIZE,%d,%.9f,%ld,%d,%d\n", mal_rank(), MPI_Wtime() - mal_t_origin(), epoch, old_active, new_active);
+}
+
+void mal_trace_probe(long epoch, int probe, int active, double throughput, double throughput1, double speedup, double efficiency) {
+
+	if (mal_should_trace())
+		std::printf(
+			"PROBE,%d,%.9f,%ld,%d,%d,%.6f,%.6f,%.6f,%.6f\n",
+			mal_rank(),
+			MPI_Wtime() - mal_t_origin(),
+			epoch,
+			probe,
+			active,
+			throughput,
+			throughput1,
+			speedup,
+			efficiency
+		);
+
+}
+
+MalScopeTimer::MalScopeTimer(const char* new_key) {
+
+	start_t = MPI_Wtime();
+	key = new_key;
+
+}
+
+MalScopeTimer::~MalScopeTimer() {
+
+	MAL_TRACE_TIMER(key, MPI_Wtime() - start_t);
 
 }
 

@@ -2270,6 +2270,7 @@ void Resizer::commit_phase() {
 
 	}
 
+	MAL_TRACE_RESIZE(g.sync.compute_epoch.load(std::memory_order_acquire), old_a_size_, target_);
 	g.timing.resize_commit += commit_elapsed;
 	g.timing.resize_count++;
 
@@ -2429,6 +2430,7 @@ ResizeDecision decide_resize_auto(const EpochMetrics& m) {
 		if (g.comm.u_rank == 0) {
 
 			MAL_LOG_L(MAL_LOG_DEBUG, "AUTO", "bs-%s probe=%d active=%d thr=%.1f thr_1=%.1f speedup=%.2f eff=%.3f threshold=%.2f [lo=%d hi=%d]", tag, probe_n, m.active_n, m.global_thr, g.lb.thr_single_proc, (g.lb.thr_single_proc > kEpsThroughput ? m.global_thr / g.lb.thr_single_proc : 0.0), eff, threshold, g.lb.bs_lo, g.lb.bs_hi);
+			MAL_TRACE_PROBE(g.sync.compute_epoch.load(std::memory_order_acquire), probe_n, m.active_n, m.global_thr, g.lb.thr_single_proc, (g.lb.thr_single_proc > kEpsThroughput ? m.global_thr / g.lb.thr_single_proc : 0.0), eff);
 
 		}
 
@@ -3158,6 +3160,18 @@ ResizeConsensus unanimous_resize_decision() {
 
 	EpochMetrics m = gather_epoch_metrics();
 
+	const long long local_finalize = g.sync.finalize_requested.load(std::memory_order_acquire) ? 1LL : 0LL;
+	long long any_finalize_probe = 0;
+	MPI_Allreduce(&local_finalize, &any_finalize_probe, 1, MPI_LONG_LONG, MPI_MAX, g.comm.universe);
+	if (any_finalize_probe) {
+		g.sync.stop.store(true, std::memory_order_release);
+		g.sync.notify();
+		out.unanimous = true;
+		out.should_resize = false;
+		out.target = -1;
+		return out;
+	}
+
 	if (!m.any_has_loop) {
 
 		g.timing.epoch_decision += MPI_Wtime() - t_decision_start;
@@ -3182,7 +3196,6 @@ ResizeConsensus unanimous_resize_decision() {
 	const long long local_should = local_decision.should_resize ? 1LL : 0LL;
 	const long long local_target = local_decision.should_resize ? (long long)local_decision.target_active_size : -1LL;
 	const long long local_active = (long long)g.comm.a_size;
-	const long long local_finalize = g.sync.finalize_requested.load(std::memory_order_acquire) ? 1LL : 0LL;
 	const long long local_done = local_decision.done ? 1LL : 0LL;
 	const long long any_active_flag = is_active ? 1LL : 0LL;
 	const long long local_gen = (long long)g.loop_gen.load(std::memory_order_acquire);
