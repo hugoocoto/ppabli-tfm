@@ -105,6 +105,13 @@ static bool parse_env_log_level(const char* text, MalLogLevel& out) {
 
 	}
 
+	if (std::strcmp(text, "NONE") == 0 || std::strcmp(text, "none") == 0) {
+
+		out = MAL_LOG_ERROR;
+		return true;
+
+	}
+
 	return false;
 
 }
@@ -305,6 +312,23 @@ void load_env_config() {
 		} else {
 
 			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_LOG_LEVEL='%s' (valid: DEBUG/INFO/WARN/ERROR or 0..3)", v);
+
+		}
+
+	}
+
+	if (const char* v = std::getenv("MAL_TRACE_ENABLED")) {
+
+		bool val = false;
+
+		if (parse_env_bool(v, val)) {
+
+			g.cfg.trace_enabled = val;
+			MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "MAL_TRACE_ENABLED=%d", (int)val);
+
+		} else {
+
+			MAL_LOG_L(MAL_LOG_WARN, "CONFIG", "Ignoring MAL_TRACE_ENABLED='%s' (valid bool)", v);
 
 		}
 
@@ -774,6 +798,10 @@ void mal_init(MalResizePolicy policy) {
 	rc = MPI_Comm_size(g.comm.universe, &g.comm.u_size);
 	log_mpi_error("MPI_Comm_size(universe)", rc);
 
+	MAL_TRACE_START();
+	if (g.comm.u_rank == 0)
+		MAL_TRACE_META("universe_size", g.comm.u_size);
+
 	if (policy == MAL_RESIZE_POLICY_FIXED_SEQUENCE) {
 
 		validate_resize_sequence_against_universe_or_abort();
@@ -797,6 +825,8 @@ void mal_init(MalResizePolicy policy) {
 	}
 
 	MAL_LOG_L(MAL_LOG_DEBUG, "CONFIG", "Initial active size: %d (universe=%d)", effective_initial_size, g.comm.u_size);
+	if (g.comm.u_rank == 0)
+		MAL_TRACE_META("initial_size", effective_initial_size);
 
 	const bool init_immutable = !g.cfg.malleability_enabled.load(std::memory_order_relaxed) || (!g.cfg.enabled.load(std::memory_order_relaxed) && !g.cfg.load_balancing_enabled.load(std::memory_order_relaxed));
 
@@ -1392,7 +1422,6 @@ void mal_step(MalFor& f, void* full_buf, size_t elem_size, long total_n) {
 void mal_finalize() {
 
 	const int saved_u_rank = g.comm.u_rank;
-	const int saved_u_size = g.comm.u_size;
 
 	mal_wait_attach_tasks();
 
@@ -1635,26 +1664,28 @@ void mal_finalize() {
 
 	if (g.timing.enabled) {
 
-		std::printf("TIMING,%d,%d,init,%.6f\n", saved_u_rank, saved_u_size, g.timing.init);
-		std::printf("TIMING,%d,%d,mal_for,%.6f\n", saved_u_rank, saved_u_size, g.timing.mal_for_total);
-		std::printf("TIMING,%d,%d,attach,%.6f\n", saved_u_rank, saved_u_size, g.timing.attach_total);
-		std::printf("TIMING,%d,%d,check_wait_resize,%.6f\n", saved_u_rank, saved_u_size, g.timing.check_wait_resize);
-		std::printf("TIMING,%d,%d,check_wait_attach,%.6f\n", saved_u_rank, saved_u_size, g.timing.check_wait_attach);
-		std::printf("TIMING,%d,%d,check_wait_total,%.6f\n", saved_u_rank, saved_u_size, g.timing.check_wait_total);
-		std::printf("TIMING,%d,%d,check_for_total,%.6f\n", saved_u_rank, saved_u_size, g.timing.check_for_total);
-		std::printf("TIMING,%d,%d,resize_prepare,%.6f\n", saved_u_rank, saved_u_size, g.timing.resize_prepare);
-		std::printf("TIMING,%d,%d,resize_commit,%.6f\n", saved_u_rank, saved_u_size, g.timing.resize_commit);
-		std::printf("TIMING,%d,%d,resize_count,%d\n", saved_u_rank, saved_u_size, g.timing.resize_count);
-		std::printf("TIMING,%d,%d,epoch_decision,%.6f\n", saved_u_rank, saved_u_size, g.timing.epoch_decision);
-		std::printf("TIMING,%d,%d,epoch_decision_count,%d\n", saved_u_rank, saved_u_size, g.timing.epoch_decision_count);
-		std::printf("TIMING,%d,%d,fin_worker_join,%.6f\n", saved_u_rank, saved_u_size, g.timing.finalize_worker_join);
-		std::printf("TIMING,%d,%d,fin_vec_gather,%.6f\n", saved_u_rank, saved_u_size, g.timing.finalize_vec_gather);
-		std::printf("TIMING,%d,%d,fin_acc_reduce,%.6f\n", saved_u_rank, saved_u_size, g.timing.finalize_acc_reduce);
-		std::printf("TIMING,%d,%d,fin_cleanup,%.6f\n", saved_u_rank, saved_u_size, g.timing.finalize_cleanup);
-		std::printf("TIMING,%d,%d,wait_for_compute,%.6f\n", saved_u_rank, saved_u_size, g.timing.wait_for_compute);
+		mal_trace_timer(saved_u_rank, "init", g.timing.init);
+		mal_trace_timer(saved_u_rank, "mal_for", g.timing.mal_for_total);
+		mal_trace_timer(saved_u_rank, "attach", g.timing.attach_total);
+		mal_trace_timer(saved_u_rank, "check_wait_resize", g.timing.check_wait_resize);
+		mal_trace_timer(saved_u_rank, "check_wait_attach", g.timing.check_wait_attach);
+		mal_trace_timer(saved_u_rank, "check_wait_total", g.timing.check_wait_total);
+		mal_trace_timer(saved_u_rank, "check_for_total", g.timing.check_for_total);
+		mal_trace_timer(saved_u_rank, "resize_prepare", g.timing.resize_prepare);
+		mal_trace_timer(saved_u_rank, "resize_commit", g.timing.resize_commit);
+		mal_trace_timer(saved_u_rank, "resize_count", g.timing.resize_count);
+		mal_trace_timer(saved_u_rank, "epoch_decision", g.timing.epoch_decision);
+		mal_trace_timer(saved_u_rank, "epoch_decision_count", g.timing.epoch_decision_count);
+		mal_trace_timer(saved_u_rank, "fin_worker_join", g.timing.finalize_worker_join);
+		mal_trace_timer(saved_u_rank, "fin_vec_gather", g.timing.finalize_vec_gather);
+		mal_trace_timer(saved_u_rank, "fin_acc_reduce", g.timing.finalize_acc_reduce);
+		mal_trace_timer(saved_u_rank, "fin_cleanup", g.timing.finalize_cleanup);
+		mal_trace_timer(saved_u_rank, "wait_for_compute", g.timing.wait_for_compute);
 		std::fflush(stdout);
 
 	}
+
+	MAL_TRACE_END();
 
 }
 

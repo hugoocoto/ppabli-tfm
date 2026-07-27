@@ -9,6 +9,7 @@
 #include <memory>
 #include <utility>
 #include <vector>
+#include <sstream>
 
 #define MAL_ALWAYS_INLINE __attribute__((always_inline)) inline
 #define MAL_LIKELY(x) __builtin_expect(!!(x), 1)
@@ -25,15 +26,93 @@ double mal_worker_runq_seconds();
 
 enum MalLogLevel {
 
-	MAL_LOG_DEBUG, MAL_LOG_INFO, MAL_LOG_WARN, MAL_LOG_ERROR,
+	MAL_LOG_DEBUG, MAL_LOG_INFO, MAL_LOG_WARN, MAL_LOG_ERROR, MAL_LOG_NONE,
 
 };
 
 const char* mal_log_level_name(MalLogLevel level);
 bool mal_should_log(MalLogLevel level);
 
-#define MAL_LOG(level, fmt, ...) do { MalLogLevel _mal_level = (level); if (mal_should_log(_mal_level)) printf("[t=%10.4f][%-5s][R%d] | " fmt "\n", MPI_Wtime() - mal_t_origin(), mal_log_level_name(_mal_level), mal_rank(), ##__VA_ARGS__); } while (0)
-#define MAL_LOG_L(level, tag, fmt, ...) do { MalLogLevel _mal_level = (level); if (mal_should_log(_mal_level)) printf("[t=%10.4f][%-5s][%-6s][R%d] | " fmt "\n", MPI_Wtime() - mal_t_origin(), mal_log_level_name(_mal_level), (tag), mal_rank(), ##__VA_ARGS__); } while (0)
+#if !defined(MAL_LOG_DISABLED)
+#define MAL_LOG(level, fmt, ...)                         \
+	do {                                                 \
+		MalLogLevel _mal_level = (level);                \
+		if (mal_should_log(_mal_level))                  \
+			printf("[t=%10.4f][%-5s][R%d] | " fmt "\n",  \
+				MPI_Wtime() - mal_t_origin(),            \
+				mal_log_level_name(_mal_level),          \
+				mal_rank(),                              \
+				##__VA_ARGS__);                          \
+	} while (0)
+
+#define MAL_LOG_L(level, tag, fmt, ...)                        \
+	do {                                                       \
+		MalLogLevel _mal_level = (level);                      \
+		if (mal_should_log(_mal_level))                        \
+			printf("[t=%10.4f][%-5s][%-6s][R%d] | " fmt "\n",  \
+				MPI_Wtime() - mal_t_origin(),                  \
+				mal_log_level_name(_mal_level),                \
+				(tag),                                         \
+				mal_rank(),                                    \
+				##__VA_ARGS__);                                \
+	} while (0)
+#else
+#define MAL_LOG(level, fmt, ...)         ((void)0)
+#define MAL_LOG_L(level, tag, fmt, ...)  ((void)0)
+#endif
+
+
+bool mal_should_trace();
+void mal_trace_start();
+void mal_trace_end();
+void mal_trace_timer(int rank, const char* name, double seconds);
+void mal_trace_resize(long epoch, int old_active, int new_active);
+void mal_trace_probe(long epoch, int probe, int active, double throughput, double throughput1, double speedup, double efficiency);
+
+struct MalScopeTimer {
+
+	MalScopeTimer(const char* key);
+	~MalScopeTimer();
+
+	private:
+		const char* key = nullptr;
+		double start_t = 0.0;
+
+};
+
+template<typename T> inline void mal_trace_meta(const char* key, const T& value) {
+	if (mal_should_trace()) {
+		std::ostringstream ss;
+		ss << value;
+		std::printf("META,%d,%s,%s\n", mal_rank(), key, ss.str().c_str());
+	}
+}
+template<typename T> inline void mal_trace_result(const char* key, const T& value) {
+	if (mal_should_trace()) {
+		std::ostringstream ss;
+		ss << value;
+		std::printf("RESULT,%d,%s,%s\n", mal_rank(), key, ss.str().c_str());
+	}
+}
+
+#if !defined(MAL_TRACE_DISABLED)
+#define MAL_TRACE_START() mal_trace_start()
+#define MAL_TRACE_END() mal_trace_end()
+#define MAL_TRACE_TIMER(key, seconds) mal_trace_timer(mal_rank(), key, seconds)
+#define MAL_TRACE_RESIZE(epoch, old, new) mal_trace_resize(epoch, old, new)
+#define MAL_TRACE_PROBE(epoch, probe, active, thr, thr1, speedup, efficiency) mal_trace_probe(epoch, probe, active, thr, thr1, speedup, efficiency)
+#define MAL_TRACE_META(key, value) mal_trace_meta(key, value)
+#define MAL_TRACE_RESULT(key, value) mal_trace_result(key, value)
+#else
+#define MAL_TRACE_START() ((void)0)
+#define MAL_TRACE_END() ((void)0)
+#define MAL_TRACE_TIMER(key, seconds) ((void)0)
+#define MAL_TRACE_RESIZE(epoch, old, new) ((void)0)
+#define MAL_TRACE_PROBE(epoch, probe, active, thr, thr1, speedup, efficiency) ((void)0)
+#define MAL_TRACE_META(key, value) ((void)0)
+#define MAL_TRACE_RESULT(key, value) ((void)0)
+#endif
+
 
 struct MalVec;
 struct MalAcc;
