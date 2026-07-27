@@ -4,8 +4,8 @@
 #SBATCH -o suite_exp_%j.out
 #SBATCH -e suite_exp_%j.err
 #SBATCH --nodes=2
-#SBATCH --ntasks-per-node=32
-#SBATCH --cpus-per-task=2
+#SBATCH --ntasks-per-node=64
+#SBATCH --cpus-per-task=1
 #SBATCH --mem-per-cpu=2G
 #SBATCH --time=07:00:00
 
@@ -51,7 +51,8 @@ NM_WORK=40000
 NM_EPOCH=40
 NM_MODES=(none cpu cache)
 
-MAX_SECONDS=900
+MAX_SECONDS=25200
+RUN_TIMEOUT=600
 NODE_SCRATCH="${LOCAL_SCRATCH:-${TMPDIR:-/tmp}}"
 RESULTS_DIR="$SLURM_SUBMIT_DIR/results"
 RUN="$RESULTS_DIR/suite_run_${SLURM_JOB_ID}"
@@ -184,6 +185,31 @@ git rev-parse HEAD > "$RUN/commit.txt" 2>/dev/null || true
 lscpu > "$RUN/lscpu.txt" 2>/dev/null || true
 env | grep -E '^(MAL_|OMPI_MCA_)' > "$RUN/env.txt" || true
 
+check_header() {
+
+	local f="$1" want="$2"
+
+	if [[ -f "$f" ]]; then
+
+		local have
+		have=$(head -1 "$f")
+
+		if [[ "$have" != "$want" ]]; then
+
+			echo "[FATAL] $f already exists with a DIFFERENT schema; appending would silently misalign columns."
+			echo "        move it aside and resubmit."
+			exit 1
+
+		fi
+
+	else
+
+		echo "$want" > "$f"
+
+	fi
+
+}
+
 if [[ ! -f "$ALLCSV" ]]; then
 
 	echo "experiment,kernel,sharing,placement,noise_mode,noise_target,noise_us,n_noisy,yield,epoch_ms,config,np,iter,exec,version,mode,nproc,nproc_active,n,time,errors" > "$ALLCSV"
@@ -208,30 +234,30 @@ if [[ ! -f "$ALLENERGY" ]]; then
 
 fi
 
-read_energy_uj() {
+read_energy_snapshot() {
 
-	local total=0 f v ok=0
+	local f v r
 
 	for f in /sys/class/powercap/intel-rapl:*/energy_uj; do
 
 		[[ -r "$f" ]] || continue
 		v=$(cat "$f" 2>/dev/null) || continue
-		total=$((total + v))
-		ok=1
+		r=$(cat "${f%energy_uj}max_energy_range_uj" 2>/dev/null) || r=0
+		echo "$f $v $r"
 
 	done
 
-	if [[ "$ok" == "1" ]]; then
+}
 
-		echo "$total"
+energy_delta_joules() {
 
-	fi
+	awk 'NR==FNR{v0[$1]=$2; next} ($1 in v0){d=$2-v0[$1]; if(d<0 && $3>0) d+=$3; if(d>=0) t+=d; ok=1} END{if(ok) printf "%.3f", t/1000000}' <(printf '%s\n' "$1") <(printf '%s\n' "$2")
 
 }
 
 ENERGY_ON=0
 
-if [[ -n "$(read_energy_uj)" ]]; then
+if [[ -n "$(read_energy_snapshot)" ]]; then
 
 	ENERGY_ON=1
 
@@ -298,26 +324,62 @@ run_one() {
 	local map="$1" bin="$2" args="$3" env_extra="$4"
 	local out line errf meta
 
-	meta="${EXP},${KERN},${SHARING},${PLACE},${NMODE},${NTGT},${NUS},${NN},${YLD},${EPOCH},${CFG},${NPV},${ITV}"
+	local nmode_eff="$NMODE"
+
+	if [[ "$NMODE" != "none" && ${#DAEMON_PIDS[@]} -gt 0 ]]; then
+
+		local alive=0 p
+
+		for p in "${DAEMON_PIDS[@]}"; do
+
+			if kill -0 "$p" 2>/dev/null; then
+
+				alive=$((alive + 1))
+
+			fi
+
+		done
+
+		if [[ "$alive" -lt ${#DAEMON_PIDS[@]} ]]; then
+
+			nmode_eff="${NMODE}_degraded"
+			echo "[WARN] stressors ${alive}/${#DAEMON_PIDS[@]} alive -> row tagged noise_mode=${nmode_eff}"
+
+		fi
+
+	fi
+
+	local nn_eff="$NN" ntgt_eff="$NTGT"
+
+	if [[ "$NMODE" == "none" ]]; then
+
+		nn_eff=0
+		ntgt_eff=none
+
+	fi
+
+	meta="${EXP},${KERN},${SHARING},${PLACE},${nmode_eff},${ntgt_eff},${NUS},${nn_eff},${YLD},${EPOCH},${CFG},${NPV},${ITV}"
 	errf="$RUN/e_${EXP}_${KERN}_${SHARING}_${PLACE}_${NMODE}_${NTGT}_${NUS}_${YLD}_${EPOCH}_${CFG}_np${NPV}_it${ITV}.err"
 
 	local e0="" e1=""
 
 	if [[ "$ENERGY_ON" == "1" ]]; then
 
-		e0=$(read_energy_uj)
+		e0=$(read_energy_snapshot)
 
 	fi
 
-	out=$(env $env_extra PLACEMENT="$PLACE" OMPI_MCA_mpi_yield_when_idle="$YLD" OMPI_MCA_opal_progress_yield_when_idle="$YLD" mpirun -n "$NPV" $map ./scripts/rank_pin.sh ./build/"$bin" $args 2>"$errf")
+	out=$(env $env_extra PLACEMENT="$PLACE" OMPI_MCA_mpi_yield_when_idle="$YLD" OMPI_MCA_opal_progress_yield_when_idle="$YLD" timeout -k 30 "$RUN_TIMEOUT" mpirun -n "$NPV" $map ./scripts/rank_pin.sh ./build/"$bin" $args 2>"$errf")
 
 	if [[ "$ENERGY_ON" == "1" ]]; then
 
-		e1=$(read_energy_uj)
+		e1=$(read_energy_snapshot)
+		local joules
+		joules=$(energy_delta_joules "$e0" "$e1")
 
-		if [[ -n "$e0" && -n "$e1" && "$e1" -gt "$e0" ]]; then
+		if [[ -n "$joules" ]]; then
 
-			echo "${meta},$(awk -v a="$e0" -v b="$e1" 'BEGIN{printf "%.3f", (b - a) / 1000000}')" >> "$ALLENERGY"
+			echo "${meta},${joules}" >> "$ALLENERGY"
 
 		fi
 

@@ -172,19 +172,43 @@ static inline bool tm_schedstats_enabled() {
 
 #if defined(__linux__)
 
-	FILE* f = std::fopen("/proc/sys/kernel/sched_schedstats", "r");
+	double a = tm_read_runq_s("/proc/thread-self/schedstat");
 
-	if (!f) {
+	if (a < 0.0) {
 
 		return false;
 
 	}
 
-	int v = 0;
-	const int n = std::fscanf(f, "%d", &v);
-	std::fclose(f);
+	FILE* f = std::fopen("/proc/sys/kernel/sched_schedstats", "r");
 
-	return (n == 1 && v == 1);
+	if (f) {
+
+		int v = 0;
+		const int n = std::fscanf(f, "%d", &v);
+		std::fclose(f);
+
+		if (n == 1 && v == 1) {
+
+			return true;
+
+		}
+
+	}
+
+	volatile double spin = 0.0;
+
+	for (long k = 0; k < 200000; k++) {
+
+		spin += (double)k;
+
+	}
+
+	(void)spin;
+
+	double b = tm_read_runq_s("/proc/thread-self/schedstat");
+
+	return (b > a);
 
 #else
 
@@ -235,6 +259,7 @@ static inline int tm_perf_open_one(unsigned int type, unsigned long long config)
 	attr.exclude_kernel = 1;
 	attr.exclude_hv = 1;
 	attr.inherit = 0;
+	attr.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
 
 	return (int)syscall(__NR_perf_event_open, &attr, 0, -1, -1, 0);
 
@@ -490,15 +515,27 @@ static inline long long tm_perf_read_one(int fd) {
 
 	}
 
-	long long v = -1;
+	unsigned long long v[3] = {0, 0, 0};
 
-	if (read(fd, &v, sizeof(v)) != (ssize_t)sizeof(v)) {
+	if (read(fd, v, sizeof(v)) != (ssize_t)sizeof(v)) {
 
 		return -1;
 
 	}
 
-	return v;
+	if (v[2] == 0) {
+
+		return -1;
+
+	}
+
+	if (v[1] == v[2]) {
+
+		return (long long)v[0];
+
+	}
+
+	return (long long)((double)v[0] * (double)v[1] / (double)v[2]);
 
 #else
 

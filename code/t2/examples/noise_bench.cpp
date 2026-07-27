@@ -225,6 +225,8 @@ int main(int argc, char* argv[]) {
 
 	tm_perf_close(pc);
 
+	int errors = -1;
+
 	{
 
 		double worker_cpu = (worker_cpu0 >= 0.0 && worker_cpu1 >= 0.0) ? worker_cpu1 - worker_cpu0 : -1.0;
@@ -286,8 +288,6 @@ int main(int argc, char* argv[]) {
 		const double p_cpu = tm_delta(snap_loop.proc_cpu_s, snap_start.proc_cpu_s);
 		const double other_cpu = (c_main >= 0.0 && p_cpu >= 0.0) ? p_cpu - c_main : -1.0;
 
-		int errors = -1;
-
 		if (mal_rank() == 0 && C) {
 
 			errors = 0;
@@ -330,11 +330,11 @@ int main(int argc, char* argv[]) {
 
 		#if BENCH_CSV
 
-			print_bench_csv("noise_bench", "malleable", "balanced", mal_size(), mal_active_size(), N, compute_seconds, 0);
+			print_bench_csv("noise_bench", "malleable", "balanced", mal_size(), mal_active_size(), N, compute_seconds, (errors > 0) ? errors : 0);
 
 		#else
 
-			int errors = 0;
+			int errors_full = 0;
 			float max_rel = 0.0f;
 
 			for (long r = 0; r < N; r++) {

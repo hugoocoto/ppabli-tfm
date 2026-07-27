@@ -1602,6 +1602,16 @@ void mal_finalize() {
 	batched_allreduce(naccs, FinalAccGetter{}, FinalAccSetter{});
 
 	g.accs.clear();
+
+	if (g.loop) {
+
+		g.loop->vecs.clear();
+		g.loop->accs.clear();
+		g.loop->phase.store(MAL_LOOP_FINISHED, std::memory_order_release);
+		g.loop = nullptr;
+
+	}
+
 	g.timing.finalize_acc_reduce = MPI_Wtime() - t0;
 
 	t0 = MPI_Wtime();

@@ -129,10 +129,10 @@ inline void papi_load_env_overrides() {
 
 		}
 
-		if (n_added < 2 || PAPI_start(es) != PAPI_OK) {
+		if (n_added < kNumPapiEvents || PAPI_start(es) != PAPI_OK) {
 
 			PAPI_destroy_eventset(&es);
-			MAL_LOG(MAL_LOG_WARN, "PAPI: could only add %d/%d events — energy metrics disabled", n_added, kNumPapiEvents);
+			MAL_LOG(MAL_LOG_WARN, "PAPI: only %d/%d events added — DISABLED (a partial set would shift the value columns positionally)", n_added, kNumPapiEvents);
 			return;
 
 		}

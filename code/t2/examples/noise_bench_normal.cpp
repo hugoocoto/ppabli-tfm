@@ -219,9 +219,10 @@ int main(int argc, char* argv[]) {
 
 	tm_perf_close(pc);
 
+	int errors = -1;
+
 	{
 
-		int errors = -1;
 
 		if (rank == 0 && C) {
 
@@ -256,13 +257,13 @@ int main(int argc, char* argv[]) {
 
 		#if BENCH_CSV
 
-			print_bench_csv("noise_bench", "normal", "balanced", size, size, N, compute_seconds, 0);
+			print_bench_csv("noise_bench", "normal", "balanced", size, size, N, compute_seconds, (errors > 0) ? errors : 0);
 
 		#else
 
 			(void)compute_seconds;
 
-			int errors = 0;
+			int errors_full = 0;
 			float max_rel = 0.0f;
 
 			for (long r = 0; r < N; r++) {
