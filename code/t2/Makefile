@@ -63,6 +63,7 @@ BUILD_DIR = build
 LIB_MAL = $(BUILD_DIR)/libmalleable.a
 LIB_SRCS = malleable/src/malleable.cpp
 LIB_OBJS = $(LIB_SRCS:%.cpp=$(BUILD_DIR)/%.o)
+LIB_DEPS = $(wildcard malleable/src/malleable_*.cpp malleable/include/*.hpp)
 
 TARGET_MC = $(BUILD_DIR)/montecarlo
 SRCS_MC = examples/montecarlo.cpp
@@ -162,6 +163,8 @@ $(LIB_MAL): Makefile $(LIB_OBJS)
 	@mkdir -p $(dir $@)
 	$(RM) $@
 	$(AR) rcs $@ $(LIB_OBJS)
+
+$(LIB_OBJS): $(LIB_DEPS)
 
 $(TARGET_MC): $(LIB_MAL) $(OBJS_MC)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_MC) $(LIB_MAL) $(LIBS)
