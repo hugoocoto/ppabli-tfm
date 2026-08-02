@@ -808,6 +808,13 @@ void mal_init(MalResizePolicy policy) {
 
 	}
 
+	if (policy == MAL_RESIZE_POLICY_CUSTOM && g.cfg.decide_resize_func == nullptr) {
+
+		MAL_LOG_L(MAL_LOG_ERROR, "INIT", "mal_set_decide_resize_func() must be called before mal_init(MAL_RESIZE_POLICY_CUSTOM)");
+		MPI_Abort(g.comm.universe, 1);
+
+	}
+
 	g.cfg.node_local_rank = detect_node_local_rank(g.comm.u_rank);
 
 	#if defined(__linux__) || defined(__APPLE__)

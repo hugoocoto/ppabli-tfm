@@ -5,7 +5,6 @@
 
 constexpr double kEpsDone = 1.0;
 constexpr double kEpsElapsed = 1e-6;
-constexpr double kEpsThroughput = 1e-9;
 constexpr double kEpsWeight = 1e-12;
 constexpr int kLbGatherFields = 2;
 constexpr int kFusedGatherFields = 1 + kLbGatherFields;
@@ -18,6 +17,12 @@ constexpr double kResizeMinHorizonEpochs = 2.0;
 constexpr double kImbHi = 1.50;
 constexpr int kImbStreakNeeded = 3;
 constexpr int kMaxGateFires = 3;
+
+void mal_set_decide_resize_func(DecideResizeFunc func) {
+
+	g.cfg.decide_resize_func = func;
+
+}
 
 inline const double* lb_row_at(const std::vector<double>& all_lb_buf, int k) {
 
@@ -115,34 +120,6 @@ public:
 
 	void prepare_phase();
 	void commit_phase();
-
-};
-
-struct EpochMetrics {
-
-	double global_thr{0.0};
-	double global_remaining{0.0};
-	int active_n{0};
-	bool any_has_loop{false};
-	double max_thr{0.0};
-	double min_thr{0.0};
-	double max_rem_time{0.0};
-	double sum_rem_time{0.0};
-	int max_slow_streak{0};
-	bool any_settled{false};
-
-	double imbalance_ratio() const {
-
-		if (active_n <= 0 || sum_rem_time <= kEpsThroughput) {
-
-			return 0.0;
-
-		}
-
-		const double avg = sum_rem_time / (double)active_n;
-		return (avg > kEpsThroughput) ? max_rem_time / avg : 0.0;
-
-	}
 
 };
 
@@ -3114,6 +3091,11 @@ ResizeDecision run_local_resize_decision(const EpochMetrics& m) {
 		case MAL_RESIZE_POLICY_FIXED_SEQUENCE:
 
 			decision = decide_resize_fixed_sequence();
+			break;
+
+		case MAL_RESIZE_POLICY_CUSTOM:
+
+			decision = g.cfg.decide_resize_func(m);
 			break;
 
 		default:

@@ -48,14 +48,6 @@
 
 #endif
 
-struct ResizeDecision {
-
-	bool should_resize{false};
-	bool done{false};
-	int target_active_size{-1};
-
-};
-
 enum EpochChangeMode {
 
 	MAL_EPOCH_CHANGE_RECALCULATE = 0, MAL_EPOCH_CHANGE_USE_LAST_DECISION = 1, };
@@ -424,6 +416,7 @@ struct MalState {
 		std::vector<int> sequence;
 		std::atomic<size_t> seq_idx{0};
 		MalResizePolicy resize_policy{MAL_RESIZE_POLICY_AUTO};
+		DecideResizeFunc decide_resize_func{nullptr};
 		std::atomic<int> epoch_ms{kDefaultEpochIntervalMs};
 		std::atomic<int> epoch_change_mode{kDefaultEpochChangeMode};
 		std::atomic<bool> enabled{true};

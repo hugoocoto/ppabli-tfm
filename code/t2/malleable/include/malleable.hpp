@@ -143,9 +143,49 @@ enum MalDataAccessMode {
 
 enum MalResizePolicy {
 
-	MAL_RESIZE_POLICY_AUTO, MAL_RESIZE_POLICY_THROUGHPUT, MAL_RESIZE_POLICY_EFFICIENCY, MAL_RESIZE_POLICY_FIXED_SEQUENCE, MAL_RESIZE_POLICY_COST,
+	MAL_RESIZE_POLICY_AUTO, MAL_RESIZE_POLICY_THROUGHPUT, MAL_RESIZE_POLICY_EFFICIENCY, MAL_RESIZE_POLICY_FIXED_SEQUENCE, MAL_RESIZE_POLICY_COST, MAL_RESIZE_POLICY_CUSTOM,
 
 };
+
+struct ResizeDecision {
+
+	bool should_resize{false};
+	bool done{false};
+	int target_active_size{-1};
+
+};
+
+constexpr double kEpsThroughput = 1e-9;
+
+struct EpochMetrics {
+
+	double global_thr{0.0};
+	double global_remaining{0.0};
+	int active_n{0};
+	bool any_has_loop{false};
+	double max_thr{0.0};
+	double min_thr{0.0};
+	double max_rem_time{0.0};
+	double sum_rem_time{0.0};
+	int max_slow_streak{0};
+	bool any_settled{false};
+
+	double imbalance_ratio() const {
+
+		if (active_n <= 0 || sum_rem_time <= kEpsThroughput) {
+
+			return 0.0;
+
+		}
+
+		const double avg = sum_rem_time / (double)active_n;
+		return (avg > kEpsThroughput) ? max_rem_time / avg : 0.0;
+
+	}
+
+};
+
+using DecideResizeFunc = ResizeDecision (*)(const EpochMetrics& m);
 
 template<typename T> struct MpiType;
 template<> struct MpiType<int> { static MPI_Datatype value() { return MPI_INT; } };
@@ -193,6 +233,11 @@ struct MalCollapseSpec {
 
 void mal_init(MalResizePolicy policy = MAL_RESIZE_POLICY_AUTO);
 void mal_finalize();
+
+/* Sets the user-provided function used to decide whether/how to resize when
+ * MAL_RESIZE_POLICY_CUSTOM is used. Must be called before
+ * mal_init(MAL_RESIZE_POLICY_CUSTOM). */
+void mal_set_decide_resize_func(DecideResizeFunc func);
 
 void mal_set_epoch_interval_ms(int ms);
 void mal_set_resize_enabled(bool enabled);
