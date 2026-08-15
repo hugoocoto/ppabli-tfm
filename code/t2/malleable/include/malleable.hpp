@@ -239,6 +239,11 @@ void mal_finalize();
  * mal_init(MAL_RESIZE_POLICY_CUSTOM). */
 void mal_set_decide_resize_func(DecideResizeFunc func);
 
+/* dlopen 'path', dlsym 'func_name' (must be extern "C"), and register the
+ * result via mal_set_decide_resize_func(). Handle is dlclosed in
+ * mal_finalize(). Must be called before mal_init(MAL_RESIZE_POLICY_CUSTOM). */
+void mal_set_decide_resize_plugin(const char* path, const char* func_name);
+
 void mal_set_epoch_interval_ms(int ms);
 void mal_set_resize_enabled(bool enabled);
 void mal_set_attach_exec_mode(MalAttachExecMode mode);

@@ -11,7 +11,7 @@ USE_PAPI ?= 0
 PAPI_PREFIX ?=
 
 CXXFLAGS = -O2 -march=native -Wall -std=c++20 -Imalleable/include -DBENCH_CSV=$(BENCH_CSV)
-LIBS = -lpthread
+LIBS = -lpthread -ldl
 
 RD_DYN_PERIOD ?= 6
 RD_DYN_N ?= 50000
@@ -97,6 +97,13 @@ TARGET_CP = $(BUILD_DIR)/custom_policy
 SRCS_CP = examples/custom_policy.cpp
 OBJS_CP = $(SRCS_CP:%.cpp=$(BUILD_DIR)/%.o)
 
+TARGET_MCP  = $(BUILD_DIR)/montecarlo_plugin_policy.so
+SRCS_MCP    = examples/montecarlo_plugin_policy.cpp
+OBJS_MCP    = $(SRCS_MCP:%.cpp=$(BUILD_DIR)/%.o)
+TARGET_MCPL = $(BUILD_DIR)/montecarlo_plugin
+SRCS_MCPL   = examples/montecarlo_plugin.cpp
+OBJS_MCPL   = $(SRCS_MCPL:%.cpp=$(BUILD_DIR)/%.o)
+
 TARGET_SPMV = $(BUILD_DIR)/spmv_imbal
 SRCS_SPMV = examples/spmv_imbal.cpp
 OBJS_SPMV = $(SRCS_SPMV:%.cpp=$(BUILD_DIR)/%.o)
@@ -159,9 +166,9 @@ OBJS_NORM_NORMAL = $(SRCS_NORM_NORMAL:%.cpp=$(BUILD_DIR)/%.o)
 
 DEPS =$(LIB_OBJS:.o=.d) $(OBJS_MC:.o=.d) $(OBJS_VEC:.o=.d) $(OBJS_MAT:.o=.d) $(OBJS_MV:.o=.d) $(OBJS_SP:.o=.d) $(OBJS_RD:.o=.d) $(OBJS_LD:.o=.d) $(OBJS_SPMV:.o=.d) $(OBJS_SPMV_NORMAL:.o=.d) $(OBJS_MC_NORMAL:.o=.d) $(OBJS_VEC_NORMAL:.o=.d) $(OBJS_MM_NORMAL:.o=.d) $(OBJS_MV_NORMAL:.o=.d) $(OBJS_SP_NORMAL:.o=.d)
 
-.PHONY: all run_montecarlo run_vector run_vector_collapse run_normalize run_normalize_normal run_matmat run_matvec run_sparse run_resize_demo run_resize_demo_dynamic run_life_dynamic run_spmv_imbal run_spmv_csr run_spmv_imbal_normal run_montecarlo_normal run_vector_normal run_vector_normal_collapse run_matmat_normal run_matvec_normal run_sparse_normal run_custom_policy test clean re
+.PHONY: all run_montecarlo run_vector run_vector_collapse run_normalize run_normalize_normal run_matmat run_matvec run_sparse run_resize_demo run_resize_demo_dynamic run_life_dynamic run_spmv_imbal run_spmv_csr run_spmv_imbal_normal run_montecarlo_normal run_vector_normal run_vector_normal_collapse run_matmat_normal run_matvec_normal run_sparse_normal run_custom_policy run_montecarlo_plugin test clean re
 
-all: $(LIB_MAL) $(TARGET_MC) $(TARGET_VEC) $(TARGET_MAT) $(TARGET_MV) $(TARGET_SP) $(TARGET_RD) $(TARGET_LD) $(TARGET_SPMV) $(TARGET_SPMV_NORMAL) $(TARGET_MC_NORMAL) $(TARGET_VEC_NORMAL) $(TARGET_MM_NORMAL) $(TARGET_MV_NORMAL) $(TARGET_SP_NORMAL) $(TARGET_HEAT_NORMAL) $(TARGET_HEAT) $(TARGET_NORM) $(TARGET_NORM_NORMAL) $(TARGET_SPMV_CSR) $(TARGET_NOISE) $(TARGET_NOISE_NORMAL) $(TARGET_NOISE_DAEMON) $(TARGET_CP)
+all: $(LIB_MAL) $(TARGET_MC) $(TARGET_VEC) $(TARGET_MAT) $(TARGET_MV) $(TARGET_SP) $(TARGET_RD) $(TARGET_LD) $(TARGET_SPMV) $(TARGET_SPMV_NORMAL) $(TARGET_MC_NORMAL) $(TARGET_VEC_NORMAL) $(TARGET_MM_NORMAL) $(TARGET_MV_NORMAL) $(TARGET_SP_NORMAL) $(TARGET_HEAT_NORMAL) $(TARGET_HEAT) $(TARGET_NORM) $(TARGET_NORM_NORMAL) $(TARGET_SPMV_CSR) $(TARGET_NOISE) $(TARGET_NOISE_NORMAL) $(TARGET_NOISE_DAEMON) $(TARGET_CP) $(TARGET_MCP) $(TARGET_MCPL)
 
 $(LIB_MAL): Makefile $(LIB_OBJS)
 	@mkdir -p $(dir $@)
@@ -190,6 +197,13 @@ $(TARGET_RD): $(LIB_MAL) $(OBJS_RD)
 
 $(TARGET_CP): $(LIB_MAL) $(OBJS_CP)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_CP) $(LIB_MAL) $(LIBS)
+
+$(TARGET_MCP): $(SRCS_MCP) malleable/include/malleable.hpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -fPIC -shared -o $@ $(SRCS_MCP)
+
+$(TARGET_MCPL): $(LIB_MAL) $(OBJS_MCPL)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_MCPL) $(LIB_MAL) $(LIBS)
 
 $(TARGET_LD): $(LIB_MAL) $(OBJS_LD)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_LD) $(LIB_MAL) $(LIBS)
@@ -274,6 +288,9 @@ run_resize_demo: $(TARGET_RD)
 
 run_custom_policy: $(TARGET_CP)
 	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_CP)
+
+run_montecarlo_plugin: $(TARGET_MCP) $(TARGET_MCPL)
+	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_MCPL)
 
 run_resize_demo_dynamic: $(TARGET_RD)
 	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_RD) --dynamic=1 --period_sec=$(RD_DYN_PERIOD) --n=$(RD_DYN_N) --fast_us=$(RD_DYN_FAST_US) --slow_us=$(RD_DYN_SLOW_US) --amp_pct=$(RD_DYN_AMP) --jitter_pct=$(RD_DYN_JITTER)

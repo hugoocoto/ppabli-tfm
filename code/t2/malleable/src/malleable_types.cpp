@@ -13,13 +13,14 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
+#include <dlfcn.h>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <numeric>
 #include <optional>
-#include <ctime>
 #include <pthread.h>
 #include <thread>
 #include <unistd.h>
@@ -417,6 +418,7 @@ struct MalState {
 		std::atomic<size_t> seq_idx{0};
 		MalResizePolicy resize_policy{MAL_RESIZE_POLICY_AUTO};
 		DecideResizeFunc decide_resize_func{nullptr}; // NOT atomic: must be set before mal_init()
+		void*            decide_resize_plugin_handle{nullptr}; // NOT atomic: dlopen handle, closed in mal_finalize()
 		std::atomic<int> epoch_ms{kDefaultEpochIntervalMs};
 		std::atomic<int> epoch_change_mode{kDefaultEpochChangeMode};
 		std::atomic<bool> enabled{true};

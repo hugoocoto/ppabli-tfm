@@ -1673,6 +1673,11 @@ void mal_finalize() {
 	log_mpi_error("MPI_Comm_free(universe)", rc);
 	g.comm.universe = MPI_COMM_NULL;
 
+	if (g.cfg.decide_resize_plugin_handle) {
+		dlclose(g.cfg.decide_resize_plugin_handle);
+		g.cfg.decide_resize_plugin_handle = nullptr;
+	}
+
 	rc = MPI_Session_finalize(&g.comm.session);
 	log_mpi_error("MPI_Session_finalize(session)", rc);
 	g.comm.session = MPI_SESSION_NULL;

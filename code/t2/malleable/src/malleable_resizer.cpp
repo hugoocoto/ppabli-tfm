@@ -24,6 +24,44 @@ void mal_set_decide_resize_func(DecideResizeFunc func) {
 
 }
 
+/* Loads 'path' with dlopen, resolves 'func_name' (must be extern "C" in the
+ * plugin), and registers it via mal_set_decide_resize_func(). The handle is
+ * closed automatically in mal_finalize(). Must be called before
+ * mal_init(MAL_RESIZE_POLICY_CUSTOM). */
+void mal_set_decide_resize_plugin(const char* path, const char* func_name) {
+
+	dlerror(); // clear any stale error
+
+	void* handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+	if (!handle) {
+		MAL_LOG_L(MAL_LOG_ERROR, "PLUGIN", "dlopen(\"%s\") failed: %s", path, dlerror());
+		MPI_Abort(MPI_COMM_WORLD, 1);
+	}
+
+	dlerror(); // clear before dlsym
+	void* sym = dlsym(handle, func_name);
+	const char* err = dlerror();
+	if (err) {
+		MAL_LOG_L(MAL_LOG_ERROR, "PLUGIN", "dlsym(\"%s\") failed: %s", func_name, err);
+		dlclose(handle);
+		MPI_Abort(MPI_COMM_WORLD, 1);
+	}
+
+	// Replace any previously loaded plugin handle.
+	if (g.cfg.decide_resize_plugin_handle) {
+		dlclose(g.cfg.decide_resize_plugin_handle);
+	}
+	g.cfg.decide_resize_plugin_handle = handle;
+
+	// void* -> function pointer: memcpy avoids C++ pedantic UB while remaining
+	// fully supported by POSIX (dlsym) and accepted by GCC/Clang.
+	DecideResizeFunc func;
+	static_assert(sizeof(func) == sizeof(sym), "function pointer size mismatch");
+	std::memcpy(&func, &sym, sizeof(func));
+	mal_set_decide_resize_func(func);
+
+}
+
 inline const double* lb_row_at(const std::vector<double>& all_lb_buf, int k) {
 
 	return &all_lb_buf[(size_t)k * (size_t)kLbGatherFields];
