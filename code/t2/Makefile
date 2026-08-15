@@ -93,6 +93,10 @@ TARGET_RD = $(BUILD_DIR)/resize_demo
 SRCS_RD = examples/resize_demo.cpp
 OBJS_RD = $(SRCS_RD:%.cpp=$(BUILD_DIR)/%.o)
 
+TARGET_CP = $(BUILD_DIR)/custom_policy
+SRCS_CP = examples/custom_policy.cpp
+OBJS_CP = $(SRCS_CP:%.cpp=$(BUILD_DIR)/%.o)
+
 TARGET_SPMV = $(BUILD_DIR)/spmv_imbal
 SRCS_SPMV = examples/spmv_imbal.cpp
 OBJS_SPMV = $(SRCS_SPMV:%.cpp=$(BUILD_DIR)/%.o)
@@ -155,9 +159,9 @@ OBJS_NORM_NORMAL = $(SRCS_NORM_NORMAL:%.cpp=$(BUILD_DIR)/%.o)
 
 DEPS =$(LIB_OBJS:.o=.d) $(OBJS_MC:.o=.d) $(OBJS_VEC:.o=.d) $(OBJS_MAT:.o=.d) $(OBJS_MV:.o=.d) $(OBJS_SP:.o=.d) $(OBJS_RD:.o=.d) $(OBJS_LD:.o=.d) $(OBJS_SPMV:.o=.d) $(OBJS_SPMV_NORMAL:.o=.d) $(OBJS_MC_NORMAL:.o=.d) $(OBJS_VEC_NORMAL:.o=.d) $(OBJS_MM_NORMAL:.o=.d) $(OBJS_MV_NORMAL:.o=.d) $(OBJS_SP_NORMAL:.o=.d)
 
-.PHONY: all run_montecarlo run_vector run_vector_collapse run_normalize run_normalize_normal run_matmat run_matvec run_sparse run_resize_demo run_resize_demo_dynamic run_life_dynamic run_spmv_imbal run_spmv_csr run_spmv_imbal_normal run_montecarlo_normal run_vector_normal run_vector_normal_collapse run_matmat_normal run_matvec_normal run_sparse_normal test clean re
+.PHONY: all run_montecarlo run_vector run_vector_collapse run_normalize run_normalize_normal run_matmat run_matvec run_sparse run_resize_demo run_resize_demo_dynamic run_life_dynamic run_spmv_imbal run_spmv_csr run_spmv_imbal_normal run_montecarlo_normal run_vector_normal run_vector_normal_collapse run_matmat_normal run_matvec_normal run_sparse_normal run_custom_policy test clean re
 
-all: $(LIB_MAL) $(TARGET_MC) $(TARGET_VEC) $(TARGET_MAT) $(TARGET_MV) $(TARGET_SP) $(TARGET_RD) $(TARGET_LD) $(TARGET_SPMV) $(TARGET_SPMV_NORMAL) $(TARGET_MC_NORMAL) $(TARGET_VEC_NORMAL) $(TARGET_MM_NORMAL) $(TARGET_MV_NORMAL) $(TARGET_SP_NORMAL) $(TARGET_HEAT_NORMAL) $(TARGET_HEAT) $(TARGET_NORM) $(TARGET_NORM_NORMAL) $(TARGET_SPMV_CSR) $(TARGET_NOISE) $(TARGET_NOISE_NORMAL) $(TARGET_NOISE_DAEMON)
+all: $(LIB_MAL) $(TARGET_MC) $(TARGET_VEC) $(TARGET_MAT) $(TARGET_MV) $(TARGET_SP) $(TARGET_RD) $(TARGET_LD) $(TARGET_SPMV) $(TARGET_SPMV_NORMAL) $(TARGET_MC_NORMAL) $(TARGET_VEC_NORMAL) $(TARGET_MM_NORMAL) $(TARGET_MV_NORMAL) $(TARGET_SP_NORMAL) $(TARGET_HEAT_NORMAL) $(TARGET_HEAT) $(TARGET_NORM) $(TARGET_NORM_NORMAL) $(TARGET_SPMV_CSR) $(TARGET_NOISE) $(TARGET_NOISE_NORMAL) $(TARGET_NOISE_DAEMON) $(TARGET_CP)
 
 $(LIB_MAL): Makefile $(LIB_OBJS)
 	@mkdir -p $(dir $@)
@@ -183,6 +187,9 @@ $(TARGET_SP): $(LIB_MAL) $(OBJS_SP)
 
 $(TARGET_RD): $(LIB_MAL) $(OBJS_RD)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_RD) $(LIB_MAL) $(LIBS)
+
+$(TARGET_CP): $(LIB_MAL) $(OBJS_CP)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_CP) $(LIB_MAL) $(LIBS)
 
 $(TARGET_LD): $(LIB_MAL) $(OBJS_LD)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS_LD) $(LIB_MAL) $(LIBS)
@@ -264,6 +271,9 @@ run_sparse: $(TARGET_SP)
 
 run_resize_demo: $(TARGET_RD)
 	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_RD)
+
+run_custom_policy: $(TARGET_CP)
+	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_CP)
 
 run_resize_demo_dynamic: $(TARGET_RD)
 	$(MPIRUN) -n $(NP) --bind-to none ./$(TARGET_RD) --dynamic=1 --period_sec=$(RD_DYN_PERIOD) --n=$(RD_DYN_N) --fast_us=$(RD_DYN_FAST_US) --slow_us=$(RD_DYN_SLOW_US) --amp_pct=$(RD_DYN_AMP) --jitter_pct=$(RD_DYN_JITTER)

@@ -416,7 +416,7 @@ struct MalState {
 		std::vector<int> sequence;
 		std::atomic<size_t> seq_idx{0};
 		MalResizePolicy resize_policy{MAL_RESIZE_POLICY_AUTO};
-		DecideResizeFunc decide_resize_func{nullptr};
+		DecideResizeFunc decide_resize_func{nullptr}; // NOT atomic: must be set before mal_init()
 		std::atomic<int> epoch_ms{kDefaultEpochIntervalMs};
 		std::atomic<int> epoch_change_mode{kDefaultEpochChangeMode};
 		std::atomic<bool> enabled{true};

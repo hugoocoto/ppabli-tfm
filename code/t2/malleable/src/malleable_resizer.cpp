@@ -3096,6 +3096,10 @@ ResizeDecision run_local_resize_decision(const EpochMetrics& m) {
 		case MAL_RESIZE_POLICY_CUSTOM:
 
 			decision = g.cfg.decide_resize_func(m);
+			if (decision.should_resize) {
+				decision.target_active_size = std::clamp(
+					decision.target_active_size, 1, g.comm.u_size);
+			}
 			break;
 
 		default:
