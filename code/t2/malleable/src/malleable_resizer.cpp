@@ -35,7 +35,7 @@ void mal_set_decide_resize_plugin(const char* path, const char* func_name) {
 	void* handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
 	if (!handle) {
 		MAL_LOG_L(MAL_LOG_ERROR, "PLUGIN", "dlopen(\"%s\") failed: %s", path, dlerror());
-		MPI_Abort(MPI_COMM_WORLD, 1);
+		std::abort();
 	}
 
 	dlerror(); // clear before dlsym
@@ -44,7 +44,7 @@ void mal_set_decide_resize_plugin(const char* path, const char* func_name) {
 	if (err) {
 		MAL_LOG_L(MAL_LOG_ERROR, "PLUGIN", "dlsym(\"%s\") failed: %s", func_name, err);
 		dlclose(handle);
-		MPI_Abort(MPI_COMM_WORLD, 1);
+		std::abort();
 	}
 
 	// Replace any previously loaded plugin handle.
